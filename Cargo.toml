@@ -1,0 +1,37 @@
+[package]
+name = "manga-reel"
+version = "0.1.0"
+edition = "2021"
+description = "Manga Reel — panel-by-panel CBZ/CBR comic reader"
+license = "MIT"
+authors = ["Predrag Urošević <pedjaurosevic@users.noreply.github.com>"]
+repository = "https://github.com/pedjaurosevic/manga-reel"
+readme = "README.md"
+keywords = ["manga", "comic", "cbz", "cbr", "gtk"]
+categories = ["multimedia", "gui"]
+
+[dependencies]
+gtk4 = { version = "0.9", features = ["v4_14"] }
+libadwaita = { version = "0.7", features = ["v1_5"] }
+glib = "0.20"
+gio = "0.20"
+gdk4 = "0.9"
+gdk-pixbuf = "0.20"
+cairo-rs = "0.20"
+
+zip = { version = "2", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "5"
+walkdir = "2"
+anyhow = "1"
+thiserror = "2"
+sha2 = "0.10"
+hex = "0.4"
+once_cell = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

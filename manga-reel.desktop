@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Manga Reel
+GenericName=Comic Reader
+Comment=Panel-by-panel CBZ/CBR comic reader
+Exec=/home/peterofovik/.local/bin/manga-reel %F
+Icon=manga-reel
+Terminal=false
+Categories=Graphics;Viewer;GTK;
+MimeType=application/vnd.comicbook+zip;application/vnd.comicbook-rar;application/x-cbz;application/x-cbr;application/x-cdisplay;
+Keywords=manga;comic;cbz;cbr;reader;panel;
+StartupNotify=true
