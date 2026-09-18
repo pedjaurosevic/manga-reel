@@ -210,7 +210,7 @@ pub fn open_reader(
                     *rs_c.borrow_mut() = Some(ReaderState {
                         archive: archive_for_init.clone(),
                         cache: PanelCacheFile {
-                            version: 1,
+                            version: 2,
                             archive_hash: String::new(),
                             pages: vec![],
                         },
@@ -633,6 +633,7 @@ pub fn open_reader(
         let step = step.clone();
         let rs = rs.clone();
         let redraw = redraw.clone();
+        let window_keys = window.clone();
         let controller = EventControllerKey::new();
         controller.connect_key_pressed(move |_, key, _, mods| {
             // Delete panel in edit mode
@@ -663,7 +664,19 @@ pub fn open_reader(
                     step(-1);
                     glib::Propagation::Stop
                 }
+                Key::F11 => {
+                    if window_keys.is_fullscreen() {
+                        window_keys.unfullscreen();
+                    } else {
+                        window_keys.fullscreen();
+                    }
+                    glib::Propagation::Stop
+                }
                 Key::Escape => {
+                    if window_keys.is_fullscreen() {
+                        window_keys.unfullscreen();
+                        return glib::Propagation::Stop;
+                    }
                     if let Some(st) = rs.borrow_mut().as_mut() {
                         st.edit_mode = false;
                     }
@@ -700,7 +713,9 @@ pub fn open_reader(
     }));
 
     window.present();
+    window.fullscreen();
 }
+
 
 
 fn update_info(info: &Label, rs: &Rc<RefCell<Option<ReaderState>>>) {

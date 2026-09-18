@@ -76,7 +76,7 @@ pub fn load_panel_cache(comic: &Path) -> Option<PanelCacheFile> {
     for candidate in [sidecar_path(comic), cache_dir_path(comic, &hash)] {
         if let Ok(text) = fs::read_to_string(&candidate) {
             if let Ok(cache) = serde_json::from_str::<PanelCacheFile>(&text) {
-                if cache.archive_hash == hash && cache.version == 1 {
+                if cache.archive_hash == hash && cache.version == 2 {
                     return Some(cache);
                 }
             }
@@ -122,7 +122,7 @@ pub fn ensure_panels(archive: &ComicArchive) -> Result<PanelCacheFile> {
         });
     }
     let cache = PanelCacheFile {
-        version: 1,
+        version: 2,
         archive_hash: hash,
         pages,
     };
