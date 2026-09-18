@@ -116,6 +116,28 @@ pub fn open_reader(
     toolbar.set_content(Some(&overlay));
     window.set_content(Some(&toolbar));
 
+    // Immersive: hide top toolbar (+ status) in fullscreen.
+    let sync_chrome = Rc::new({
+        let toolbar = toolbar.clone();
+        let header = header.clone();
+        let status_bar = status_bar.clone();
+        let window = window.clone();
+        move || {
+            let fs = window.is_fullscreen();
+            toolbar.set_reveal_top_bars(!fs);
+            header.set_visible(!fs);
+            status_bar.set_visible(!fs);
+        }
+    });
+    // Start hidden — we fullscreen immediately on open.
+    sync_chrome();
+    {
+        let sync_chrome = sync_chrome.clone();
+        window.connect_fullscreened_notify(move |_| {
+            sync_chrome();
+        });
+    }
+
     // Load panels off UI thread
     let (tx, rx) = mpsc::channel::<Result<(PanelCacheFile, Settings), String>>();
     let path = archive.path.clone();
@@ -714,6 +736,7 @@ pub fn open_reader(
 
     window.present();
     window.fullscreen();
+    sync_chrome();
 }
 
 
