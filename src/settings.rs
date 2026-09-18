@@ -1,4 +1,4 @@
-//! App settings (reading order, letterbox, film-strip speed).
+//! App settings (reading order, letterbox, pan).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -19,30 +19,34 @@ pub enum Letterbox {
     White,
 }
 
+/// How the page is scaled into the viewport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum ReaderMode {
+pub enum FitMode {
+    /// Page fills viewport width; pan vertically when taller.
     #[default]
-    Guided,
-    FilmStrip,
-    Vertical,
+    Width,
+    /// Page fills viewport height; pan horizontally when wider.
+    Height,
+    /// Entire page visible (may letterbox); pan only if zoomed past contain.
+    Contain,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub reading_order: ReadingOrder,
     pub letterbox: Letterbox,
-    pub mode: ReaderMode,
-    /// Film-strip advance interval in milliseconds.
-    pub film_strip_ms: u32,
+    pub fit: FitMode,
+    /// Keyboard pan step as fraction of viewport (0.05–0.5).
+    pub pan_step: f64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            reading_order: ReadingOrder::Rtl,
+            reading_order: ReadingOrder::Ltr,
             letterbox: Letterbox::Black,
-            mode: ReaderMode::Guided,
-            film_strip_ms: 2500,
+            fit: FitMode::Width,
+            pan_step: 0.18,
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Manga Reel — panel-by-panel CBZ/CBR comic reader (GTK4 + libadwaita).
+//! Manga Reel — CBZ/CBR comic reader with smooth page pan (GTK4 + libadwaita).
 
 mod archive;
 mod detect;

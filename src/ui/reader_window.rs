@@ -1,46 +1,35 @@
-//! Reader window: panel-by-panel guided reading + film-strip + vertical.
+//! Reader: fullscreen page view with smooth pan (no panel mode).
 
 use crate::archive::ComicArchive;
-use crate::detect::{self, PanelRect};
 use crate::library::{self, ComicProgress, LibraryState};
-use crate::page::{self, PanelCacheFile};
-use crate::settings::{self, Letterbox, ReaderMode, ReadingOrder, Settings};
+use crate::settings::{self, FitMode, Letterbox, ReadingOrder, Settings};
 use glib::clone;
 use gtk4::gdk::{Key, ModifierType};
 use gtk4::gdk_pixbuf::Pixbuf;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, DrawingArea, DropDown, EventControllerKey, Label, Orientation,
-    Overlay, SpinButton, ToggleButton,
+    Align, Box as GtkBox, Button, DrawingArea, DropDown, EventControllerKey, GestureDrag, Label,
+    Orientation, Overlay, ToggleButton,
 };
 use libadwaita::prelude::*;
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView, WindowTitle};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::mpsc;
-use std::thread;
 
 struct ReaderState {
     archive: ComicArchive,
-    cache: PanelCacheFile,
     settings: Settings,
     page_index: usize,
-    panel_index: usize,
-    /// Current page RGBA
     page_w: u32,
     page_h: u32,
     page_rgba: Vec<u8>,
-    edit_mode: bool,
-    /// Working panels for current page (editable).
-    edit_panels: Vec<PanelRect>,
-    drag: Option<DragOp>,
-}
-
-#[derive(Clone, Copy)]
-enum DragOp {
-    New { x0: f64, y0: f64, x1: f64, y1: f64 },
-    Move { idx: usize, last_x: f64, last_y: f64 },
-    Resize { idx: usize, last_x: f64, last_y: f64 },
+    /// Pan offsets in page-pixels after scale (viewport space).
+    pan_x: f64,
+    pan_y: f64,
+    /// Animated pan target.
+    target_x: f64,
+    target_y: f64,
+    drag_last: Option<(f64, f64)>,
 }
 
 pub fn open_reader(
@@ -67,33 +56,24 @@ pub fn open_reader(
 
     let prev_btn = Button::from_icon_name("go-previous-symbolic");
     let next_btn = Button::from_icon_name("go-next-symbolic");
-    prev_btn.set_tooltip_text(Some("Previous panel (Left / A)"));
-    next_btn.set_tooltip_text(Some("Next panel (Right / D / Space)"));
+    prev_btn.set_tooltip_text(Some("Previous page"));
+    next_btn.set_tooltip_text(Some("Next page"));
 
-    let order_btn = ToggleButton::with_label("RTL");
-    order_btn.set_tooltip_text(Some("Toggle LTR / RTL reading order"));
+    let order_btn = ToggleButton::with_label("LTR");
+    order_btn.set_tooltip_text(Some("Page-turn direction LTR / RTL"));
     let letter_btn = ToggleButton::with_label("Black");
-    letter_btn.set_tooltip_text(Some("Toggle letterbox black / white"));
-    let edit_btn = ToggleButton::with_label("Edit");
-    edit_btn.set_tooltip_text(Some("Manual panel edit"));
+    letter_btn.set_tooltip_text(Some("Letterbox black / white"));
+    let fit_drop = DropDown::from_strings(&["Fit width", "Fit height", "Fit page"]);
+    fit_drop.set_tooltip_text(Some("How the page fills the screen"));
 
-    let mode_drop = DropDown::from_strings(&["Guided", "Film strip", "Vertical"]);
-    mode_drop.set_tooltip_text(Some("Reading mode"));
-
-    let speed = SpinButton::with_range(500.0, 10000.0, 250.0);
-    speed.set_tooltip_text(Some("Film-strip interval (ms)"));
-    speed.set_value(2500.0);
-
-    let info = Label::new(Some("Loading panels…"));
+    let info = Label::new(Some("Loading…"));
     info.add_css_class("dim-label");
 
     header.pack_start(&prev_btn);
     header.pack_start(&next_btn);
-    header.pack_end(&edit_btn);
     header.pack_end(&letter_btn);
     header.pack_end(&order_btn);
-    header.pack_end(&speed);
-    header.pack_end(&mode_drop);
+    header.pack_end(&fit_drop);
 
     let area = DrawingArea::new();
     area.set_hexpand(true);
@@ -101,6 +81,7 @@ pub fn open_reader(
     area.set_content_width(800);
     area.set_content_height(600);
     area.set_draw_func(|_, _, _, _| {});
+    area.set_can_focus(true);
 
     let overlay = Overlay::new();
     overlay.set_child(Some(&area));
@@ -116,7 +97,6 @@ pub fn open_reader(
     toolbar.set_content(Some(&overlay));
     window.set_content(Some(&toolbar));
 
-    // Immersive: hide top toolbar (+ status) in fullscreen.
     let sync_chrome = Rc::new({
         let toolbar = toolbar.clone();
         let header = header.clone();
@@ -129,133 +109,79 @@ pub fn open_reader(
             status_bar.set_visible(!fs);
         }
     });
-    // Start hidden — we fullscreen immediately on open.
     sync_chrome();
     {
         let sync_chrome = sync_chrome.clone();
-        window.connect_fullscreened_notify(move |_| {
-            sync_chrome();
-        });
+        window.connect_fullscreened_notify(move |_| sync_chrome());
     }
 
-    // Load panels off UI thread
-    let (tx, rx) = mpsc::channel::<Result<(PanelCacheFile, Settings), String>>();
-    let path = archive.path.clone();
+    let settings = settings::load();
+    order_btn.set_active(matches!(settings.reading_order, ReadingOrder::Rtl));
+    order_btn.set_label(if matches!(settings.reading_order, ReadingOrder::Rtl) {
+        "RTL"
+    } else {
+        "LTR"
+    });
+    letter_btn.set_active(matches!(settings.letterbox, Letterbox::White));
+    letter_btn.set_label(if matches!(settings.letterbox, Letterbox::White) {
+        "White"
+    } else {
+        "Black"
+    });
+    fit_drop.set_selected(match settings.fit {
+        FitMode::Width => 0,
+        FitMode::Height => 1,
+        FitMode::Contain => 2,
+    });
+
     let page_count = archive.page_count();
-    thread::spawn(move || {
-        let settings = settings::load();
-        match ComicArchive::open(&path).and_then(|a| page::ensure_panels(&a)) {
-            Ok(cache) => {
-                let _ = tx.send(Ok((cache, settings)));
-            }
-            Err(e) => {
-                let _ = tx.send(Err(format!("{e:#}")));
-            }
+    let start_page = progress
+        .as_ref()
+        .map(|p| p.page_index.min(page_count.saturating_sub(1)))
+        .unwrap_or(0);
+
+    let (page_w, page_h, page_rgba) = match archive.load_page_rgba(start_page) {
+        Ok(v) => v,
+        Err(e) => {
+            info.set_text(&format!("Failed to load: {e:#}"));
+            window.present();
+            return;
         }
-    });
+    };
 
-    let start_page = progress.as_ref().map(|p| p.page_index.min(page_count.saturating_sub(1))).unwrap_or(0);
-    let start_panel = progress.as_ref().map(|p| p.panel_index).unwrap_or(0);
+    let rs = Rc::new(RefCell::new(Some(ReaderState {
+        archive,
+        settings,
+        page_index: start_page,
+        page_w,
+        page_h,
+        page_rgba,
+        pan_x: 0.0,
+        pan_y: 0.0,
+        target_x: 0.0,
+        target_y: 0.0,
+        drag_last: None,
+    })));
 
-    // Placeholder state until cache arrives
-    let rs = Rc::new(RefCell::new(None::<ReaderState>));
-    let film_source: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+    let animating = Rc::new(Cell::new(false));
 
-    // Poll channel
-    let area_c = area.clone();
-    let info_c = info.clone();
-    let rs_c = rs.clone();
-    let order_btn_c = order_btn.clone();
-    let letter_btn_c = letter_btn.clone();
-    let mode_drop_c = mode_drop.clone();
-    let speed_c = speed.clone();
-    let archive_for_init = archive;
-    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-        match rx.try_recv() {
-            Ok(Ok((cache, settings))) => {
-                order_btn_c.set_active(matches!(settings.reading_order, ReadingOrder::Rtl));
-                order_btn_c.set_label(if matches!(settings.reading_order, ReadingOrder::Rtl) {
-                    "RTL"
-                } else {
-                    "LTR"
-                });
-                letter_btn_c.set_active(matches!(settings.letterbox, Letterbox::White));
-                letter_btn_c.set_label(if matches!(settings.letterbox, Letterbox::White) {
-                    "White"
-                } else {
-                    "Black"
-                });
-                mode_drop_c.set_selected(match settings.mode {
-                    ReaderMode::Guided => 0,
-                    ReaderMode::FilmStrip => 1,
-                    ReaderMode::Vertical => 2,
-                });
-                speed_c.set_value(settings.film_strip_ms as f64);
+    let layout = |st: &ReaderState, vw: f64, vh: f64| -> (f64, f64, f64, f64, f64) {
+        // returns scale, draw_w, draw_h, max_pan_x, max_pan_y
+        let pw = st.page_w as f64;
+        let ph = st.page_h as f64;
+        let scale = match st.settings.fit {
+            FitMode::Width => vw / pw,
+            FitMode::Height => vh / ph,
+            FitMode::Contain => (vw / pw).min(vh / ph),
+        };
+        let dw = pw * scale;
+        let dh = ph * scale;
+        let max_x = (dw - vw).max(0.0);
+        let max_y = (dh - vh).max(0.0);
+        (scale, dw, dh, max_x, max_y)
+    };
 
-                let page_index = start_page.min(cache.pages.len().saturating_sub(1));
-                let (page_w, page_h, page_rgba) = match archive_for_init.load_page_rgba(page_index) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        info_c.set_text(&format!("Failed to load page: {e:#}"));
-                        return glib::ControlFlow::Break;
-                    }
-                };
-                let mut panels = page::panels_for_page(&cache, page_index);
-                let rtl = matches!(settings.reading_order, ReadingOrder::Rtl);
-                panels = detect::order_panels(&panels, rtl);
-                let panel_index = start_panel.min(panels.len().saturating_sub(1));
-
-                *rs_c.borrow_mut() = Some(ReaderState {
-                    archive: archive_for_init.clone(),
-                    cache,
-                    settings,
-                    page_index,
-                    panel_index,
-                    page_w,
-                    page_h,
-                    page_rgba,
-                    edit_mode: false,
-                    edit_panels: panels,
-                    drag: None,
-                });
-                info_c.set_text("Ready");
-                area_c.queue_draw();
-                update_info(&info_c, &rs_c);
-                glib::ControlFlow::Break
-            }
-            Ok(Err(e)) => {
-                info_c.set_text(&format!("Panel detect failed: {e}"));
-                // Still try single full-page fallback
-                if let Ok((page_w, page_h, page_rgba)) = archive_for_init.load_page_rgba(0) {
-                    let settings = settings::load();
-                    let panels = vec![PanelRect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }];
-                    *rs_c.borrow_mut() = Some(ReaderState {
-                        archive: archive_for_init.clone(),
-                        cache: PanelCacheFile {
-                            version: 2,
-                            archive_hash: String::new(),
-                            pages: vec![],
-                        },
-                        settings,
-                        page_index: 0,
-                        panel_index: 0,
-                        page_w,
-                        page_h,
-                        page_rgba,
-                        edit_mode: false,
-                        edit_panels: panels,
-                        drag: None,
-                    });
-                    area_c.queue_draw();
-                }
-                glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-        }
-    });
-
-    // Draw
+    // Draw full page with pan
     {
         let rs = rs.clone();
         area.set_draw_func(move |_, cr, width, height| {
@@ -272,92 +198,62 @@ pub fn open_reader(
             cr.set_source_rgb(bg.0, bg.1, bg.2);
             cr.paint().ok();
 
-            let panels = &st.edit_panels;
-            if panels.is_empty() {
-                return;
-            }
-            let panel = panels[st.panel_index.min(panels.len() - 1)];
-
-            // Vertical mode: show panel with next peek — still crop current
-            let src_x = (panel.x * st.page_w as f64).round().max(0.0) as i32;
-            let src_y = (panel.y * st.page_h as f64).round().max(0.0) as i32;
-            let src_w = (panel.w * st.page_w as f64).round().max(1.0) as i32;
-            let src_h = (panel.h * st.page_h as f64).round().max(1.0) as i32;
+            let vw = width as f64;
+            let vh = height as f64;
+            let (scale, dw, dh, max_x, max_y) = layout(st, vw, vh);
+            let pan_x = st.pan_x.clamp(0.0, max_x);
+            let pan_y = st.pan_y.clamp(0.0, max_y);
+            // Center when page smaller than viewport
+            let ox = if dw <= vw {
+                (vw - dw) / 2.0
+            } else {
+                -pan_x
+            };
+            let oy = if dh <= vh {
+                (vh - dh) / 2.0
+            } else {
+                -pan_y
+            };
 
             if let Some(pixbuf) = rgba_to_pixbuf(&st.page_rgba, st.page_w, st.page_h) {
-                let cropped = pixbuf.new_subpixbuf(
-                    src_x.clamp(0, st.page_w as i32 - 1),
-                    src_y.clamp(0, st.page_h as i32 - 1),
-                    src_w.min(st.page_w as i32 - src_x.max(0)).max(1),
-                    src_h.min(st.page_h as i32 - src_y.max(0)).max(1),
-                );
-
-                let cw = cropped.width() as f64;
-                let ch = cropped.height() as f64;
-                let scale = (width as f64 / cw).min(height as f64 / ch);
-                let dw = cw * scale;
-                let dh = ch * scale;
-                let dx = (width as f64 - dw) / 2.0;
-                let dy = (height as f64 - dh) / 2.0;
-
                 cr.save().ok();
-                cr.translate(dx, dy);
+                cr.translate(ox, oy);
                 cr.scale(scale, scale);
-                cr.set_source_pixbuf(&cropped, 0.0, 0.0);
+                cr.set_source_pixbuf(&pixbuf, 0.0, 0.0);
                 cr.paint().ok();
                 cr.restore().ok();
-
-                if st.edit_mode {
-                    // Draw all panel outlines in page space mapped to widget
-                    // Map full page into letterboxed fit
-                    let ps = (width as f64 / st.page_w as f64).min(height as f64 / st.page_h as f64);
-                    let pw = st.page_w as f64 * ps;
-                    let ph = st.page_h as f64 * ps;
-                    let px = (width as f64 - pw) / 2.0;
-                    let py = (height as f64 - ph) / 2.0;
-                    // Show full page underneath outlines in edit mode
-                    cr.set_source_rgb(bg.0, bg.1, bg.2);
-                    cr.paint().ok();
-                    cr.save().ok();
-                    cr.translate(px, py);
-                    cr.scale(ps, ps);
-                    if let Some(full) = rgba_to_pixbuf(&st.page_rgba, st.page_w, st.page_h) {
-                        cr.set_source_pixbuf(&full, 0.0, 0.0);
-                        cr.paint().ok();
-                    }
-                    for (i, p) in st.edit_panels.iter().enumerate() {
-                        let x = p.x * st.page_w as f64;
-                        let y = p.y * st.page_h as f64;
-                        let w = p.w * st.page_w as f64;
-                        let h = p.h * st.page_h as f64;
-                        if i == st.panel_index {
-                            cr.set_source_rgba(0.2, 0.7, 1.0, 0.9);
-                            cr.set_line_width(3.0 / ps);
-                        } else {
-                            cr.set_source_rgba(1.0, 0.85, 0.2, 0.8);
-                            cr.set_line_width(2.0 / ps);
-                        }
-                        cr.rectangle(x, y, w, h);
-                        cr.stroke().ok();
-                    }
-                    if let Some(DragOp::New { x0, y0, x1, y1 }) = st.drag {
-                        cr.set_source_rgba(0.3, 1.0, 0.4, 0.9);
-                        cr.set_line_width(2.0 / ps);
-                        cr.rectangle(x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs());
-                        cr.stroke().ok();
-                    }
-                    cr.restore().ok();
-                }
             }
         });
     }
 
-    let redraw = {
-        let area = area.clone();
+    let update_info = {
         let info = info.clone();
         let rs = rs.clone();
         Rc::new(move || {
-            update_info(&info, &rs);
+            let borrow = rs.borrow();
+            let Some(st) = borrow.as_ref() else {
+                info.set_text("…");
+                return;
+            };
+            let fit = match st.settings.fit {
+                FitMode::Width => "width",
+                FitMode::Height => "height",
+                FitMode::Contain => "page",
+            };
+            info.set_text(&format!(
+                "Page {}/{} · fit {} · arrows pan · edges turn page",
+                st.page_index + 1,
+                st.archive.page_count(),
+                fit
+            ));
+        })
+    };
+
+    let redraw = {
+        let area = area.clone();
+        let update_info = update_info.clone();
+        Rc::new(move || {
+            update_info();
             area.queue_draw();
         })
     };
@@ -367,104 +263,205 @@ pub fn open_reader(
         let lib_state = lib_state.clone();
         Rc::new(move || {
             if let Some(st) = rs.borrow().as_ref() {
-                library::set_progress(
-                    &mut lib_state.borrow_mut(),
-                    &st.archive.path,
-                    st.page_index,
-                    st.panel_index,
-                );
+                library::set_progress(&mut lib_state.borrow_mut(), &st.archive.path, st.page_index, 0);
                 let _ = library::save_state(&lib_state.borrow());
                 let _ = settings::save(&st.settings);
             }
         })
     };
 
-    let step = {
+    let clamp_pan = {
+        let rs = rs.clone();
+        let area = area.clone();
+        Rc::new(move || {
+            let alloc = area.allocation();
+            let vw = alloc.width() as f64;
+            let vh = alloc.height() as f64;
+            let mut borrow = rs.borrow_mut();
+            let Some(st) = borrow.as_mut() else { return };
+            let (_, _, _, max_x, max_y) = layout(st, vw, vh);
+            st.pan_x = st.pan_x.clamp(0.0, max_x);
+            st.pan_y = st.pan_y.clamp(0.0, max_y);
+            st.target_x = st.target_x.clamp(0.0, max_x);
+            st.target_y = st.target_y.clamp(0.0, max_y);
+        })
+    };
+
+    let goto_page = {
         let rs = rs.clone();
         let redraw = redraw.clone();
         let save_progress = save_progress.clone();
-        Rc::new(move |delta: i32| {
+        let clamp_pan = clamp_pan.clone();
+        Rc::new(move |index: usize| {
             let mut borrow = rs.borrow_mut();
             let Some(st) = borrow.as_mut() else { return };
-            if st.edit_mode {
+            if index >= st.archive.page_count() {
                 return;
             }
-            let rtl = matches!(st.settings.reading_order, ReadingOrder::Rtl);
-            let mut panels = page::panels_for_page(&st.cache, st.page_index);
-            panels = detect::order_panels(&panels, rtl);
-            st.edit_panels = panels.clone();
-
-            let len = st.edit_panels.len().max(1);
-            let next = st.panel_index as i32 + delta;
-            if next < 0 {
-                if st.page_index == 0 {
-                    return;
-                }
-                // prev page
-                let new_page = st.page_index - 1;
-                if let Ok((w, h, rgba)) = st.archive.load_page_rgba(new_page) {
-                    st.page_index = new_page;
-                    st.page_w = w;
-                    st.page_h = h;
-                    st.page_rgba = rgba;
-                    let mut panels = page::panels_for_page(&st.cache, new_page);
-                    panels = detect::order_panels(&panels, rtl);
-                    st.edit_panels = panels;
-                    st.panel_index = st.edit_panels.len().saturating_sub(1);
-                }
-            } else if next as usize >= len {
-                if st.page_index + 1 >= st.archive.page_count() {
-                    return;
-                }
-                let new_page = st.page_index + 1;
-                if let Ok((w, h, rgba)) = st.archive.load_page_rgba(new_page) {
-                    st.page_index = new_page;
-                    st.page_w = w;
-                    st.page_h = h;
-                    st.page_rgba = rgba;
-                    let mut panels = page::panels_for_page(&st.cache, new_page);
-                    panels = detect::order_panels(&panels, rtl);
-                    st.edit_panels = panels;
-                    st.panel_index = 0;
-                }
-            } else {
-                st.panel_index = next as usize;
+            if let Ok((w, h, rgba)) = st.archive.load_page_rgba(index) {
+                st.page_index = index;
+                st.page_w = w;
+                st.page_h = h;
+                st.page_rgba = rgba;
+                st.pan_x = 0.0;
+                st.pan_y = 0.0;
+                st.target_x = 0.0;
+                st.target_y = 0.0;
+                drop(borrow);
+                clamp_pan();
+                save_progress();
+                redraw();
             }
+        })
+    };
+
+    // Smooth animation toward target pan
+    let tick_anim = {
+        let rs = rs.clone();
+        let redraw = redraw.clone();
+        let animating = animating.clone();
+        Rc::new(move || {
+            let mut borrow = rs.borrow_mut();
+            let Some(st) = borrow.as_mut() else {
+                animating.set(false);
+                return;
+            };
+            let dx = st.target_x - st.pan_x;
+            let dy = st.target_y - st.pan_y;
+            if dx.abs() < 0.5 && dy.abs() < 0.5 {
+                st.pan_x = st.target_x;
+                st.pan_y = st.target_y;
+                animating.set(false);
+                drop(borrow);
+                redraw();
+                return;
+            }
+            // Ease: move ~22% of remaining each frame (~smooth)
+            st.pan_x += dx * 0.22;
+            st.pan_y += dy * 0.22;
             drop(borrow);
-            save_progress();
             redraw();
         })
     };
 
-    prev_btn.connect_clicked(clone!(@strong step => move |_| step(-1)));
-    next_btn.connect_clicked(clone!(@strong step => move |_| step(1)));
+    let ensure_anim = {
+        let animating = animating.clone();
+        let tick_anim = tick_anim.clone();
+        Rc::new(move || {
+            if animating.get() {
+                return;
+            }
+            animating.set(true);
+            let tick_anim = tick_anim.clone();
+            let animating = animating.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                tick_anim();
+                if animating.get() {
+                    glib::ControlFlow::Continue
+                } else {
+                    glib::ControlFlow::Break
+                }
+            });
+        })
+    };
+
+    /// Pan by delta in viewport pixels. Returns true if pan applied, false if at edge (caller may turn page).
+    let try_pan = {
+        let rs = rs.clone();
+        let area = area.clone();
+        let ensure_anim = ensure_anim.clone();
+        let clamp_pan = clamp_pan.clone();
+        Rc::new(move |dx: f64, dy: f64| -> bool {
+            let alloc = area.allocation();
+            let vw = alloc.width() as f64;
+            let vh = alloc.height() as f64;
+            let mut borrow = rs.borrow_mut();
+            let Some(st) = borrow.as_mut() else { return false };
+            let (_, _, _, max_x, max_y) = layout(st, vw, vh);
+            let before_x = st.target_x;
+            let before_y = st.target_y;
+            st.target_x = (st.target_x + dx).clamp(0.0, max_x);
+            st.target_y = (st.target_y + dy).clamp(0.0, max_y);
+            let moved = (st.target_x - before_x).abs() > 0.5 || (st.target_y - before_y).abs() > 0.5;
+            drop(borrow);
+            if moved {
+                clamp_pan();
+                ensure_anim();
+            }
+            moved
+        })
+    };
+
+    let turn_or_pan = {
+        let rs = rs.clone();
+        let try_pan = try_pan.clone();
+        let goto_page = goto_page.clone();
+        let area = area.clone();
+        Rc::new(move |dir_x: i32, dir_y: i32| {
+            // dir: -1 left/up, +1 right/down
+            let alloc = area.allocation();
+            let vw = alloc.width() as f64;
+            let vh = alloc.height() as f64;
+            let step = {
+                let borrow = rs.borrow();
+                let st = borrow.as_ref();
+                st.map(|s| s.settings.pan_step).unwrap_or(0.18)
+            };
+            let dx = dir_x as f64 * vw * step;
+            let dy = dir_y as f64 * vh * step;
+            if try_pan(dx, dy) {
+                return;
+            }
+            // At edge → turn page (respect RTL for horizontal)
+            let rtl = {
+                let borrow = rs.borrow();
+                borrow
+                    .as_ref()
+                    .map(|s| matches!(s.settings.reading_order, ReadingOrder::Rtl))
+                    .unwrap_or(false)
+            };
+            let (page_delta, _) = if dir_x != 0 {
+                let d = if rtl { -dir_x } else { dir_x };
+                (d, 0)
+            } else {
+                (dir_y, 0)
+            };
+            let next = {
+                let borrow = rs.borrow();
+                let Some(st) = borrow.as_ref() else { return };
+                st.page_index as i32 + page_delta
+            };
+            if next >= 0 {
+                goto_page(next as usize);
+            }
+        })
+    };
+
+    prev_btn.connect_clicked(clone!(@strong goto_page, @strong rs => move |_| {
+        let i = rs.borrow().as_ref().map(|s| s.page_index.saturating_sub(1)).unwrap_or(0);
+        goto_page(i);
+    }));
+    next_btn.connect_clicked(clone!(@strong goto_page, @strong rs => move |_| {
+        let i = rs.borrow().as_ref().map(|s| s.page_index + 1).unwrap_or(0);
+        goto_page(i);
+    }));
 
     {
         let rs = rs.clone();
-        let redraw = redraw.clone();
         let save_progress = save_progress.clone();
         order_btn.connect_toggled(move |btn| {
-            let mut borrow = rs.borrow_mut();
-            let Some(st) = borrow.as_mut() else { return };
-            st.settings.reading_order = if btn.is_active() {
-                btn.set_label("RTL");
-                ReadingOrder::Rtl
-            } else {
-                btn.set_label("LTR");
-                ReadingOrder::Ltr
-            };
-            let rtl = matches!(st.settings.reading_order, ReadingOrder::Rtl);
-            st.edit_panels = detect::order_panels(
-                &page::panels_for_page(&st.cache, st.page_index),
-                rtl,
-            );
-            st.panel_index = st.panel_index.min(st.edit_panels.len().saturating_sub(1));
-            drop(borrow);
+            if let Some(st) = rs.borrow_mut().as_mut() {
+                st.settings.reading_order = if btn.is_active() {
+                    btn.set_label("RTL");
+                    ReadingOrder::Rtl
+                } else {
+                    btn.set_label("LTR");
+                    ReadingOrder::Ltr
+                };
+            }
             save_progress();
-            redraw();
         });
     }
-
     {
         let rs = rs.clone();
         let redraw = redraw.clone();
@@ -483,207 +480,82 @@ pub fn open_reader(
             redraw();
         });
     }
-
     {
         let rs = rs.clone();
         let redraw = redraw.clone();
-        edit_btn.connect_toggled(move |btn| {
+        let save_progress = save_progress.clone();
+        let clamp_pan = clamp_pan.clone();
+        fit_drop.connect_selected_notify(move |drop| {
             if let Some(st) = rs.borrow_mut().as_mut() {
-                st.edit_mode = btn.is_active();
-                if !st.edit_mode {
-                    // Persist edits into cache
-                    if let Some(page) = st.cache.pages.iter_mut().find(|p| p.page_index == st.page_index) {
-                        page.panels = st.edit_panels.clone();
-                    } else {
-                        st.cache.pages.push(page::PagePanels {
-                            page_index: st.page_index,
-                            width: st.page_w,
-                            height: st.page_h,
-                            panels: st.edit_panels.clone(),
-                        });
-                    }
-                    let _ = page::save_panel_cache(&st.archive.path, &st.cache, true);
-                }
+                st.settings.fit = match drop.selected() {
+                    1 => FitMode::Height,
+                    2 => FitMode::Contain,
+                    _ => FitMode::Width,
+                };
+                st.pan_x = 0.0;
+                st.pan_y = 0.0;
+                st.target_x = 0.0;
+                st.target_y = 0.0;
             }
+            clamp_pan();
+            save_progress();
             redraw();
         });
     }
 
-    // Mode + film strip timer
+    // Drag to pan
     {
         let rs = rs.clone();
-        let film_source = film_source.clone();
-        let step = step.clone();
-        let speed = speed.clone();
-        let save_progress = save_progress.clone();
-        mode_drop.connect_selected_notify(move |drop| {
+        let redraw = redraw.clone();
+        let clamp_pan = clamp_pan.clone();
+        let drag = GestureDrag::new();
+        drag.connect_drag_begin(clone!(@strong rs => move |_, _, _| {
             if let Some(st) = rs.borrow_mut().as_mut() {
-                st.settings.mode = match drop.selected() {
-                    1 => ReaderMode::FilmStrip,
-                    2 => ReaderMode::Vertical,
-                    _ => ReaderMode::Guided,
-                };
-            }
-            if let Some(id) = film_source.take() {
-                id.remove();
-            }
-            let mode = rs.borrow().as_ref().map(|s| s.settings.mode).unwrap_or_default();
-            if mode == ReaderMode::FilmStrip {
-                let ms = speed.value().max(500.0) as u64;
-                let step = step.clone();
-                let id = glib::timeout_add_local(std::time::Duration::from_millis(ms), move || {
-                    step(1);
-                    glib::ControlFlow::Continue
-                });
-                film_source.set(Some(id));
-            }
-            save_progress();
-        });
-    }
-
-    {
-        let rs = rs.clone();
-        let save_progress = save_progress.clone();
-        speed.connect_value_changed(move |sp| {
-            if let Some(st) = rs.borrow_mut().as_mut() {
-                st.settings.film_strip_ms = sp.value() as u32;
-            }
-            save_progress();
-        });
-    }
-
-    // Mouse for edit mode
-    {
-        let rs = rs.clone();
-        let area2 = area.clone();
-        let click = gtk4::GestureClick::new();
-        click.set_button(1);
-        click.connect_pressed(clone!(@strong rs, @strong area2 => move |_, _, x, y| {
-            let mut borrow = rs.borrow_mut();
-            let Some(st) = borrow.as_mut() else { return };
-            if !st.edit_mode { return; }
-            let Some((px, py, ps)) = page_map(area2.width(), area2.height(), st.page_w, st.page_h) else { return };
-            let ix = (x - px) / ps;
-            let iy = (y - py) / ps;
-            // Hit-test existing panel (resize corner vs move)
-            let mut hit = None;
-            for (i, p) in st.edit_panels.iter().enumerate() {
-                let x0 = p.x * st.page_w as f64;
-                let y0 = p.y * st.page_h as f64;
-                let x1 = x0 + p.w * st.page_w as f64;
-                let y1 = y0 + p.h * st.page_h as f64;
-                if ix >= x0 && ix <= x1 && iy >= y0 && iy <= y1 {
-                    let near_br = (x1 - ix).abs() < 12.0 && (y1 - iy).abs() < 12.0;
-                    hit = Some((i, near_br));
-                    break;
-                }
-            }
-            st.drag = match hit {
-                Some((idx, true)) => Some(DragOp::Resize { idx, last_x: ix, last_y: iy }),
-                Some((idx, false)) => {
-                    st.panel_index = idx;
-                    Some(DragOp::Move { idx, last_x: ix, last_y: iy })
-                }
-                None => Some(DragOp::New { x0: ix, y0: iy, x1: ix, y1: iy }),
-            };
-        }));
-        click.connect_released(clone!(@strong rs, @strong area2 => move |_, _, _, _| {
-            let mut borrow = rs.borrow_mut();
-            let Some(st) = borrow.as_mut() else { return };
-            if let Some(DragOp::New { x0, y0, x1, y1 }) = st.drag.take() {
-                let nx0 = x0.min(x1).max(0.0);
-                let ny0 = y0.min(y1).max(0.0);
-                let nx1 = x0.max(x1).min(st.page_w as f64);
-                let ny1 = y0.max(y1).min(st.page_h as f64);
-                let w = nx1 - nx0;
-                let h = ny1 - ny0;
-                if w > 8.0 && h > 8.0 {
-                    st.edit_panels.push(PanelRect {
-                        x: nx0 / st.page_w as f64,
-                        y: ny0 / st.page_h as f64,
-                        w: w / st.page_w as f64,
-                        h: h / st.page_h as f64,
-                    });
-                    st.panel_index = st.edit_panels.len() - 1;
-                }
-            }
-            area2.queue_draw();
-        }));
-        area.add_controller(click);
-
-        let motion = gtk4::EventControllerMotion::new();
-        motion.connect_motion(clone!(@strong rs, @strong area2 => move |_, x, y| {
-            let mut borrow = rs.borrow_mut();
-            let Some(st) = borrow.as_mut() else { return };
-            if !st.edit_mode { return; }
-            let Some((px, py, ps)) = page_map(area2.width(), area2.height(), st.page_w, st.page_h) else { return };
-            let ix = (x - px) / ps;
-            let iy = (y - py) / ps;
-            match st.drag {
-                Some(DragOp::New { x0, y0, .. }) => {
-                    st.drag = Some(DragOp::New { x0, y0, x1: ix, y1: iy });
-                    area2.queue_draw();
-                }
-                Some(DragOp::Move { idx, last_x, last_y }) => {
-                    if let Some(p) = st.edit_panels.get_mut(idx) {
-                        let dx = (ix - last_x) / st.page_w as f64;
-                        let dy = (iy - last_y) / st.page_h as f64;
-                        p.x = (p.x + dx).clamp(0.0, 1.0 - p.w);
-                        p.y = (p.y + dy).clamp(0.0, 1.0 - p.h);
-                    }
-                    st.drag = Some(DragOp::Move { idx, last_x: ix, last_y: iy });
-                    area2.queue_draw();
-                }
-                Some(DragOp::Resize { idx, last_x, last_y }) => {
-                    if let Some(p) = st.edit_panels.get_mut(idx) {
-                        let dx = (ix - last_x) / st.page_w as f64;
-                        let dy = (iy - last_y) / st.page_h as f64;
-                        p.w = (p.w + dx).clamp(0.02, 1.0 - p.x);
-                        p.h = (p.h + dy).clamp(0.02, 1.0 - p.y);
-                    }
-                    st.drag = Some(DragOp::Resize { idx, last_x: ix, last_y: iy });
-                    area2.queue_draw();
-                }
-                None => {}
+                st.drag_last = Some((st.pan_x, st.pan_y));
+                st.target_x = st.pan_x;
+                st.target_y = st.pan_y;
             }
         }));
-        area.add_controller(motion);
+        drag.connect_drag_update(clone!(@strong rs, @strong redraw, @strong clamp_pan => move |g, _, _| {
+            let Some((dx, dy)) = g.offset() else { return };
+            let mut borrow = rs.borrow_mut();
+            let Some(st) = borrow.as_mut() else { return };
+            let Some((ox, oy)) = st.drag_last else { return };
+            st.pan_x = ox - dx;
+            st.pan_y = oy - dy;
+            st.target_x = st.pan_x;
+            st.target_y = st.pan_y;
+            drop(borrow);
+            clamp_pan();
+            redraw();
+        }));
+        area.add_controller(drag);
     }
 
     // Keys
     {
-        let step = step.clone();
-        let rs = rs.clone();
-        let redraw = redraw.clone();
+        let turn_or_pan = turn_or_pan.clone();
         let window_keys = window.clone();
         let controller = EventControllerKey::new();
         controller.connect_key_pressed(move |_, key, _, mods| {
-            // Delete panel in edit mode
-            if key == Key::Delete || key == Key::BackSpace {
-                let mut borrow = rs.borrow_mut();
-                if let Some(st) = borrow.as_mut() {
-                    if st.edit_mode && !st.edit_panels.is_empty() {
-                        st.edit_panels.remove(st.panel_index.min(st.edit_panels.len() - 1));
-                        if st.edit_panels.is_empty() {
-                            st.edit_panels.push(PanelRect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 });
-                        }
-                        st.panel_index = st.panel_index.min(st.edit_panels.len() - 1);
-                        drop(borrow);
-                        redraw();
-                        return glib::Propagation::Stop;
-                    }
-                }
-            }
             if mods.contains(ModifierType::CONTROL_MASK) {
                 return glib::Propagation::Proceed;
             }
             match key {
-                Key::Right | Key::space | Key::d | Key::D | Key::Page_Down | Key::Down | Key::j | Key::J => {
-                    step(1);
+                Key::Right | Key::d | Key::D | Key::l | Key::L => {
+                    turn_or_pan(1, 0);
                     glib::Propagation::Stop
                 }
-                Key::Left | Key::a | Key::A | Key::Page_Up | Key::Up | Key::k | Key::K | Key::BackSpace => {
-                    step(-1);
+                Key::Left | Key::a | Key::A | Key::h | Key::H => {
+                    turn_or_pan(-1, 0);
+                    glib::Propagation::Stop
+                }
+                Key::Down | Key::j | Key::J | Key::space | Key::Page_Down => {
+                    turn_or_pan(0, 1);
+                    glib::Propagation::Stop
+                }
+                Key::Up | Key::k | Key::K | Key::Page_Up | Key::BackSpace => {
+                    turn_or_pan(0, -1);
                     glib::Propagation::Stop
                 }
                 Key::F11 => {
@@ -699,11 +571,7 @@ pub fn open_reader(
                         window_keys.unfullscreen();
                         return glib::Propagation::Stop;
                     }
-                    if let Some(st) = rs.borrow_mut().as_mut() {
-                        st.edit_mode = false;
-                    }
-                    redraw();
-                    glib::Propagation::Stop
+                    glib::Propagation::Proceed
                 }
                 _ => glib::Propagation::Proceed,
             }
@@ -711,56 +579,35 @@ pub fn open_reader(
         window.add_controller(controller);
     }
 
-    // Scroll wheel → next/prev (vertical mode especially)
+    // Scroll wheel pans (smooth-ish via try_pan)
     {
-        let step = step.clone();
+        let try_pan = try_pan.clone();
+        let turn_or_pan = turn_or_pan.clone();
         let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         scroll.connect_scroll(move |_, _dx, dy| {
-            if dy > 0.0 {
-                step(1);
-            } else if dy < 0.0 {
-                step(-1);
+            let amount = dy * 80.0;
+            if !try_pan(0.0, amount) {
+                if dy > 0.0 {
+                    turn_or_pan(0, 1);
+                } else if dy < 0.0 {
+                    turn_or_pan(0, -1);
+                }
             }
             glib::Propagation::Stop
         });
         area.add_controller(scroll);
     }
 
-    window.connect_close_request(clone!(@strong save_progress, @strong film_source => move |_| {
+    window.connect_close_request(clone!(@strong save_progress => move |_| {
         save_progress();
-        if let Some(id) = film_source.take() {
-            id.remove();
-        }
         glib::Propagation::Proceed
     }));
 
+    update_info();
     window.present();
     window.fullscreen();
     sync_chrome();
-}
-
-
-
-fn update_info(info: &Label, rs: &Rc<RefCell<Option<ReaderState>>>) {
-    let borrow = rs.borrow();
-    let Some(st) = borrow.as_ref() else {
-        info.set_text("Loading…");
-        return;
-    };
-    let mode = match st.settings.mode {
-        ReaderMode::Guided => "Guided",
-        ReaderMode::FilmStrip => "Film strip",
-        ReaderMode::Vertical => "Vertical",
-    };
-    info.set_text(&format!(
-        "Page {}/{} · Panel {}/{} · {} · {}",
-        st.page_index + 1,
-        st.archive.page_count(),
-        st.panel_index + 1,
-        st.edit_panels.len().max(1),
-        mode,
-        if matches!(st.settings.reading_order, ReadingOrder::Rtl) { "RTL" } else { "LTR" }
-    ));
+    area.grab_focus();
 }
 
 fn rgba_to_pixbuf(rgba: &[u8], w: u32, h: u32) -> Option<Pixbuf> {
@@ -773,16 +620,4 @@ fn rgba_to_pixbuf(rgba: &[u8], w: u32, h: u32) -> Option<Pixbuf> {
         h as i32,
         (w * 4) as i32,
     ))
-}
-
-fn page_map(widget_w: i32, widget_h: i32, page_w: u32, page_h: u32) -> Option<(f64, f64, f64)> {
-    if widget_w <= 0 || widget_h <= 0 || page_w == 0 || page_h == 0 {
-        return None;
-    }
-    let ps = (widget_w as f64 / page_w as f64).min(widget_h as f64 / page_h as f64);
-    let pw = page_w as f64 * ps;
-    let ph = page_h as f64 * ps;
-    let px = (widget_w as f64 - pw) / 2.0;
-    let py = (widget_h as f64 - ph) / 2.0;
-    Some((px, py, ps))
 }
