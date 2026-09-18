@@ -36,6 +36,3 @@ lto = true
 codegen-units = 1
 strip = true
 
-[build-dependencies]
-base64 = "0.22"
-flate2 = "1"
