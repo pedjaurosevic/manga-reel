@@ -1,6 +1,7 @@
 // Reader: fullscreen page pan + chrome toggle + seamless strip autoscroll.
 
 use crate::archive::ComicArchive;
+use crate::detect::{self, PanelRect};
 use crate::library::{self, ComicProgress, LibraryState};
 use crate::settings::{self, FitMode, Letterbox, ReadingOrder, Settings};
 use glib::clone;
@@ -32,6 +33,12 @@ struct ReaderState {
     target_y: f64,
     drag_last: Option<(f64, f64)>,
     autoscroll: bool,
+    /// When true, draw/navigate cropped panels instead of page strip.
+    panel_mode: bool,
+    panel_index: usize,
+    panels: Vec<PanelRect>,
+    /// Cached detections: page_index -> ordered panels
+    panel_cache: std::collections::HashMap<usize, Vec<PanelRect>>,
 }
 
 const AUTOSCROLL_PPS_MIN: f64 = 12.0;
@@ -59,6 +66,78 @@ fn paint_page(cr: &gtk4::cairo::Context, img: &PageImage, scale: f64, ox: f64, o
         cr.set_source_pixbuf(&pixbuf, 0.0, 0.0);
         cr.paint().ok();
         cr.restore().ok();
+    }
+}
+
+
+fn detect_ordered_panels(img: &PageImage, rtl: bool) -> Vec<PanelRect> {
+    let raw = detect::detect_panels(&img.rgba, img.w, img.h);
+    detect::order_panels(&raw, rtl)
+}
+
+fn ensure_page_panels(st: &mut ReaderState) {
+    let rtl = matches!(st.settings.reading_order, ReadingOrder::Rtl);
+    if let Some(cached) = st.panel_cache.get(&st.page_index) {
+        st.panels = cached.clone();
+        if st.panel_index >= st.panels.len() {
+            st.panel_index = st.panels.len().saturating_sub(1);
+        }
+        return;
+    }
+    let panels = detect_ordered_panels(&st.current, rtl);
+    st.panel_cache.insert(st.page_index, panels.clone());
+    st.panels = panels;
+    if st.panel_index >= st.panels.len() {
+        st.panel_index = st.panels.len().saturating_sub(1);
+    }
+}
+
+/// Pick panel index from current vertical pan (page view) so entering Panel
+/// starts at the "next" frame in the active strip.
+fn panel_index_from_pan(st: &ReaderState, vw: f64, vh: f64) -> usize {
+    if st.panels.is_empty() {
+        return 0;
+    }
+    let (_, _, dh) = page_layout(st.settings.fit, st.current.w as f64, st.current.h as f64, vw, vh);
+    if dh <= 1.0 {
+        return 0;
+    }
+    let mid_norm = ((st.pan_y + vh * 0.35) / dh).clamp(0.0, 0.999);
+    for (i, p) in st.panels.iter().enumerate() {
+        let cy = p.y + p.h * 0.5;
+        if cy + 0.02 >= mid_norm {
+            return i;
+        }
+    }
+    st.panels.len().saturating_sub(1)
+}
+
+fn paint_panel_full_height(cr: &gtk4::cairo::Context, img: &PageImage, panel: &PanelRect, vw: f64, vh: f64) {
+    // Always black side bars in panel mode (per product spec).
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.paint().ok();
+    let pw = (panel.w * img.w as f64).max(1.0);
+    let ph = (panel.h * img.h as f64).max(1.0);
+    let px = (panel.x * img.w as f64).max(0.0);
+    let py = (panel.y * img.h as f64).max(0.0);
+    let scale = vh / ph;
+    let dw = pw * scale;
+    let dh = vh;
+    let ox = (vw - dw) / 2.0;
+    let oy = 0.0;
+    if let Some(full) = rgba_to_pixbuf(&img.rgba, img.w, img.h) {
+        let sx = px.round().clamp(0.0, (img.w as f64 - 1.0).max(0.0)) as i32;
+        let sy = py.round().clamp(0.0, (img.h as f64 - 1.0).max(0.0)) as i32;
+        let sw = pw.round().clamp(1.0, (img.w as i32 - sx).max(1) as f64) as i32;
+        let sh = ph.round().clamp(1.0, (img.h as i32 - sy).max(1) as f64) as i32;
+        let sub = full.new_subpixbuf(sx, sy, sw, sh);
+        cr.save().ok();
+        cr.translate(ox, oy);
+        cr.scale(scale, scale);
+        cr.set_source_pixbuf(&sub, 0.0, 0.0);
+        cr.paint().ok();
+        cr.restore().ok();
+        let _ = (dw, dh);
     }
 }
 
@@ -107,6 +186,8 @@ pub fn open_reader(
     letter_btn.set_tooltip_text(Some("Letterbox black / white"));
     let auto_btn = ToggleButton::with_label("Auto");
     auto_btn.set_tooltip_text(Some("Autoscroll (Space) — seamless continuous strip"));
+    let panel_btn = ToggleButton::with_label("Panel");
+    panel_btn.set_tooltip_text(Some("Panel mode — full-height frames; toggle returns to page pan"));
 
     let speed_box = GtkBox::new(Orientation::Horizontal, 2);
     speed_box.set_tooltip_text(Some("Autoscroll speed (only while Auto is on)"));
@@ -133,6 +214,7 @@ pub fn open_reader(
     header.pack_end(&letter_btn);
     header.pack_end(&order_btn);
     header.pack_end(&speed_box);
+    header.pack_end(&panel_btn);
     header.pack_end(&auto_btn);
     header.pack_end(&fit_drop);
 
@@ -221,10 +303,15 @@ pub fn open_reader(
         target_y: 0.0,
         drag_last: None,
         autoscroll: false,
+        panel_mode: false,
+        panel_index: 0,
+        panels: Vec::new(),
+        panel_cache: std::collections::HashMap::new(),
     })));
 
     let animating = Rc::new(Cell::new(false));
     let autoscroll_on = Rc::new(Cell::new(false));
+    let panel_mode_on = Rc::new(Cell::new(false));
 
     {
         let rs = rs.clone();
@@ -239,10 +326,19 @@ pub fn open_reader(
                 Letterbox::Black => (0.0, 0.0, 0.0),
                 Letterbox::White => (1.0, 1.0, 1.0),
             };
-            cr.set_source_rgb(bg.0, bg.1, bg.2);
-            cr.paint().ok();
             let vw = width as f64;
             let vh = height as f64;
+            if st.panel_mode {
+                if let Some(panel) = st.panels.get(st.panel_index) {
+                    paint_panel_full_height(cr, &st.current, panel, vw, vh);
+                } else {
+                    cr.set_source_rgb(0.0, 0.0, 0.0);
+                    cr.paint().ok();
+                }
+                return;
+            }
+            cr.set_source_rgb(bg.0, bg.1, bg.2);
+            cr.paint().ok();
             let fit = st.settings.fit;
             let (scale, dw, dh) = page_layout(fit, st.current.w as f64, st.current.h as f64, vw, vh);
             let max_x = (dw - vw).max(0.0);
@@ -276,10 +372,18 @@ pub fn open_reader(
                 FitMode::Contain => "page",
             };
             let auto = if autoscroll_on.get() { " · AUTO" } else { "" };
-            info.set_text(&format!(
-                "Page {}/{} · fit {}{} · dbl-click chrome · Space auto",
-                st.page_index + 1, st.archive.page_count(), fit, auto
-            ));
+            if st.panel_mode {
+                let pc = st.panels.len().max(1);
+                info.set_text(&format!(
+                    "Page {}/{} · panel {}/{} · Panel mode · Space next",
+                    st.page_index + 1, st.archive.page_count(), st.panel_index + 1, pc
+                ));
+            } else {
+                info.set_text(&format!(
+                    "Page {}/{} · fit {}{} · dbl-click chrome · Space auto",
+                    st.page_index + 1, st.archive.page_count(), fit, auto
+                ));
+            }
         })
     };
 
@@ -405,6 +509,11 @@ pub fn open_reader(
             st.pan_y = 0.0;
             st.target_x = 0.0;
             st.target_y = 0.0;
+            st.panels.clear();
+            st.panel_index = 0;
+            if st.panel_mode {
+                ensure_page_panels(st);
+            }
             drop(borrow);
             refresh_neighbors();
             save_progress();
@@ -556,6 +665,108 @@ pub fn open_reader(
         })
     };
 
+    let set_panel_mode = {
+        let rs = rs.clone();
+        let panel_mode_on = panel_mode_on.clone();
+        let panel_btn = panel_btn.clone();
+        let pause_autoscroll = pause_autoscroll.clone();
+        let redraw = redraw.clone();
+        let area = area.clone();
+        Rc::new(move |on: bool| {
+            if on {
+                pause_autoscroll();
+            }
+            panel_mode_on.set(on);
+            if panel_btn.is_active() != on {
+                panel_btn.set_active(on);
+            }
+            let alloc = area.allocation();
+            let vw = alloc.width().max(1) as f64;
+            let vh = alloc.height().max(1) as f64;
+            if let Some(st) = rs.borrow_mut().as_mut() {
+                st.panel_mode = on;
+                if on {
+                    ensure_page_panels(st);
+                    st.panel_index = panel_index_from_pan(st, vw, vh);
+                }
+            }
+            redraw();
+        })
+    };
+
+    let step_panel = {
+        let rs = rs.clone();
+        let redraw = redraw.clone();
+        let save_progress = save_progress.clone();
+        let refresh_neighbors = refresh_neighbors.clone();
+        Rc::new(move |delta: i32| {
+            // Advance/retreat panel; page boundary uses same full-height paint.
+            loop {
+                let mut borrow = rs.borrow_mut();
+                let Some(st) = borrow.as_mut() else { return; };
+                if !st.panel_mode {
+                    return;
+                }
+                ensure_page_panels(st);
+                if st.panels.is_empty() {
+                    st.panels = vec![PanelRect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }];
+                }
+                let next_i = st.panel_index as i32 + delta;
+                if next_i >= 0 && (next_i as usize) < st.panels.len() {
+                    st.panel_index = next_i as usize;
+                    drop(borrow);
+                    redraw();
+                    return;
+                }
+                if delta > 0 {
+                    let next_page = st.page_index + 1;
+                    if next_page >= st.archive.page_count() {
+                        return;
+                    }
+                    let Some(img) = load_image(&st.archive, next_page) else { return; };
+                    st.page_index = next_page;
+                    st.current = img;
+                    st.next = None;
+                    st.prev = None;
+                    st.pan_x = 0.0;
+                    st.pan_y = 0.0;
+                    st.target_x = 0.0;
+                    st.target_y = 0.0;
+                    st.panel_index = 0;
+                    st.panels.clear();
+                    ensure_page_panels(st);
+                    drop(borrow);
+                    refresh_neighbors();
+                    save_progress();
+                    redraw();
+                    return;
+                } else {
+                    if st.page_index == 0 {
+                        return;
+                    }
+                    let prev_page = st.page_index - 1;
+                    let Some(img) = load_image(&st.archive, prev_page) else { return; };
+                    st.page_index = prev_page;
+                    st.current = img;
+                    st.next = None;
+                    st.prev = None;
+                    st.pan_x = 0.0;
+                    st.pan_y = 0.0;
+                    st.target_x = 0.0;
+                    st.target_y = 0.0;
+                    st.panels.clear();
+                    ensure_page_panels(st);
+                    st.panel_index = st.panels.len().saturating_sub(1);
+                    drop(borrow);
+                    refresh_neighbors();
+                    save_progress();
+                    redraw();
+                    return;
+                }
+            }
+        })
+    };
+
     {
         let rs = rs.clone();
         let autoscroll_on = autoscroll_on.clone();
@@ -563,8 +774,13 @@ pub fn open_reader(
         let normalize_strip = normalize_strip.clone();
         let strip_limits = strip_limits.clone();
         let set_autoscroll = set_autoscroll.clone();
+        let panel_mode_on = panel_mode_on.clone();
         let last = std::cell::Cell::new(None::<std::time::Instant>);
         glib::timeout_add_local(Duration::from_millis(16), move || {
+            if panel_mode_on.get() {
+                last.set(None);
+                return glib::ControlFlow::Continue;
+            }
             if !autoscroll_on.get() {
                 last.set(None);
                 return glib::ControlFlow::Continue;
@@ -594,19 +810,38 @@ pub fn open_reader(
         });
     }
 
-    prev_btn.connect_clicked(clone!(@strong goto_page, @strong rs, @strong pause_autoscroll => move |_| {
+    prev_btn.connect_clicked(clone!(@strong goto_page, @strong rs, @strong pause_autoscroll, @strong step_panel, @strong panel_mode_on => move |_| {
         pause_autoscroll();
+        if panel_mode_on.get() {
+            step_panel(-1);
+            return;
+        }
         let i = rs.borrow().as_ref().map(|s| s.page_index.saturating_sub(1)).unwrap_or(0);
         goto_page(i);
     }));
-    next_btn.connect_clicked(clone!(@strong goto_page, @strong rs, @strong pause_autoscroll => move |_| {
+    next_btn.connect_clicked(clone!(@strong goto_page, @strong rs, @strong pause_autoscroll, @strong step_panel, @strong panel_mode_on => move |_| {
         pause_autoscroll();
+        if panel_mode_on.get() {
+            step_panel(1);
+            return;
+        }
         let i = rs.borrow().as_ref().map(|s| s.page_index + 1).unwrap_or(0);
         goto_page(i);
     }));
     {
         let set_autoscroll = set_autoscroll.clone();
-        auto_btn.connect_toggled(move |btn| set_autoscroll(btn.is_active()));
+        let panel_mode_on = panel_mode_on.clone();
+        auto_btn.connect_toggled(move |btn| {
+            if panel_mode_on.get() {
+                btn.set_active(false);
+                return;
+            }
+            set_autoscroll(btn.is_active());
+        });
+    }
+    {
+        let set_panel_mode = set_panel_mode.clone();
+        panel_btn.connect_toggled(move |btn| set_panel_mode(btn.is_active()));
     }
     {
         let bump = bump_autoscroll_speed.clone();
@@ -684,7 +919,8 @@ pub fn open_reader(
         let strip_limits = strip_limits.clone();
         let pause_autoscroll = pause_autoscroll.clone();
         let drag = GestureDrag::new();
-        drag.connect_drag_begin(clone!(@strong rs, @strong pause_autoscroll => move |_, _, _| {
+        drag.connect_drag_begin(clone!(@strong rs, @strong pause_autoscroll, @strong panel_mode_on => move |_, _, _| {
+            if panel_mode_on.get() { return; }
             pause_autoscroll();
             if let Some(st) = rs.borrow_mut().as_mut() {
                 st.drag_last = Some((st.pan_x, st.pan_y));
@@ -692,7 +928,8 @@ pub fn open_reader(
                 st.target_y = st.pan_y;
             }
         }));
-        drag.connect_drag_update(clone!(@strong rs, @strong redraw, @strong normalize_strip, @strong strip_limits => move |g, _, _| {
+        drag.connect_drag_update(clone!(@strong rs, @strong redraw, @strong normalize_strip, @strong strip_limits, @strong panel_mode_on => move |g, _, _| {
+            if panel_mode_on.get() { return; }
             let Some((dx, dy)) = g.offset() else { return; };
             let (max_x, min_y, max_y) = strip_limits();
             let mut borrow = rs.borrow_mut();
@@ -717,10 +954,44 @@ pub fn open_reader(
         let bump_autoscroll_speed = bump_autoscroll_speed.clone();
         let chrome_visible = chrome_visible.clone();
         let sync_chrome = sync_chrome.clone();
+        let panel_mode_on = panel_mode_on.clone();
+        let step_panel = step_panel.clone();
+        let set_panel_mode = set_panel_mode.clone();
         let controller = EventControllerKey::new();
         controller.connect_key_pressed(move |_, key, _, mods| {
             if mods.contains(ModifierType::CONTROL_MASK) {
                 return glib::Propagation::Proceed;
+            }
+            if panel_mode_on.get() {
+                match key {
+                    Key::Right | Key::d | Key::D | Key::l | Key::L | Key::Down | Key::j | Key::J | Key::Page_Down | Key::space => {
+                        step_panel(1); return glib::Propagation::Stop;
+                    }
+                    Key::Left | Key::a | Key::A | Key::h | Key::H | Key::Up | Key::k | Key::K | Key::Page_Up | Key::BackSpace => {
+                        step_panel(-1); return glib::Propagation::Stop;
+                    }
+                    Key::p | Key::P => {
+                        set_panel_mode(false); return glib::Propagation::Stop;
+                    }
+                    Key::t | Key::T => {
+                        chrome_visible.set(!chrome_visible.get());
+                        sync_chrome();
+                        return glib::Propagation::Stop;
+                    }
+                    Key::F11 => {
+                        if window_keys.is_fullscreen() { window_keys.unfullscreen(); } else { window_keys.fullscreen(); }
+                        return glib::Propagation::Stop;
+                    }
+                    Key::Escape => {
+                        // Spec: leave Panel first conceptually via toggle; Esc still only exits fullscreen.
+                        if window_keys.is_fullscreen() {
+                            window_keys.unfullscreen();
+                            return glib::Propagation::Stop;
+                        }
+                        return glib::Propagation::Proceed;
+                    }
+                    _ => return glib::Propagation::Proceed,
+                }
             }
             match key {
                 Key::Right | Key::d | Key::D | Key::l | Key::L => { turn_or_pan(1, 0); glib::Propagation::Stop }
@@ -728,6 +999,7 @@ pub fn open_reader(
                 Key::Down | Key::j | Key::J | Key::Page_Down => { turn_or_pan(0, 1); glib::Propagation::Stop }
                 Key::Up | Key::k | Key::K | Key::Page_Up | Key::BackSpace => { turn_or_pan(0, -1); glib::Propagation::Stop }
                 Key::space => { set_autoscroll(!autoscroll_on.get()); glib::Propagation::Stop }
+                Key::p | Key::P => { set_panel_mode(true); glib::Propagation::Stop }
                 Key::minus | Key::KP_Subtract => {
                     if autoscroll_on.get() { bump_autoscroll_speed(-AUTOSCROLL_PPS_STEP); }
                     glib::Propagation::Stop
@@ -763,7 +1035,14 @@ pub fn open_reader(
         let turn_or_pan = turn_or_pan.clone();
         let pause_autoscroll = pause_autoscroll.clone();
         let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        let panel_mode_on = panel_mode_on.clone();
+        let step_panel = step_panel.clone();
         scroll.connect_scroll(move |_, _dx, dy| {
+            if panel_mode_on.get() {
+                if dy > 0.0 { step_panel(1); }
+                else if dy < 0.0 { step_panel(-1); }
+                return glib::Propagation::Stop;
+            }
             pause_autoscroll();
             let amount = dy * 80.0;
             if !try_pan(0.0, amount) {

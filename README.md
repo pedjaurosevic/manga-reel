@@ -64,3 +64,7 @@ MIT — see [LICENSE](LICENSE).
 
 
 While **Auto** is on, the toolbar shows ↓ / ↑ and a `px/s` label to change autoscroll speed (also `-` / `+` keys). Speed is saved.
+
+
+### Panel mode
+Toggle **Panel** on the toolbar (or `P`). Shows the next detected frame at full height with black side bars. Arrows / Space / scroll move panel-to-panel, including across pages. Toggle **Panel** again to return to page pan.
