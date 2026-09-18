@@ -1,8 +1,8 @@
-//! Italian-style comic panel detection (v3).
+//! Italian-style comic panel detection (v4).
 //!
-//! Finds gutter-bounded rectangular frames (often 2 per row). Prefers full
-//! row/column gutters and refuses recursive content splits that carve figures
-//! out of the inside of a panel.
+//! Confident gutter grids → edge-to-edge panels (full height on screen).
+//! Uncertain / unconventional pages → whole page, or clear full-width row
+//! slices — never invent tight crops with fake margins.
 
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +14,7 @@ pub struct PanelRect {
     pub h: f64,
 }
 
-const CACHE_NOTE: u32 = 3;
+const CACHE_NOTE: u32 = 4;
 #[allow(dead_code)]
 pub const DETECT_VERSION: u32 = CACHE_NOTE;
 
@@ -30,34 +30,121 @@ pub fn detect_panels(rgba: &[u8], width: u32, height: u32) -> Vec<PanelRect> {
 
     let white = detect_grid(&lum, sw, sh, true);
     let dark = detect_grid(&lum, sw, sh, false);
-    let best = pick_better(white, dark, sw, sh);
+    let (best, best_score) = pick_better_scored(white, dark, sw, sh);
 
-    let mut panels: Vec<PanelRect> = best
-        .into_iter()
-        .map(|(x, y, pw, ph)| PanelRect {
-            x: x as f64 / sw as f64,
-            y: y as f64 / sh as f64,
+    // High confidence grid → edge-to-edge panel rects (no inset/margin pad).
+    if best_score >= 6.5 && looks_like_clean_grid(&best, sw, sh) {
+        let panels = to_norm_panels(&best, sw, sh);
+        if !panels.is_empty() {
+            return panels;
+        }
+    }
+
+    // Medium: clear horizontal rows only → full-width page slices (safer than
+    // inventing vertical cuts on unconventional art).
+    let row_white = detect_row_slices(&lum, sw, sh, true);
+    let row_dark = detect_row_slices(&lum, sw, sh, false);
+    let (rows, row_score) = pick_better_scored(row_white, row_dark, sw, sh);
+    if row_score >= 4.0 && rows.len() >= 2 && rows.len() <= 8 {
+        let panels = to_norm_panels(&rows, sw, sh);
+        if panels.iter().all(|p| p.w >= 0.85) {
+            return panels;
+        }
+    }
+
+    // Low confidence / weird page → whole page as one panel.
+    let _ = best;
+    full_page()
+}
+
+fn to_norm_panels(rects: &[(usize, usize, usize, usize)], sw: usize, sh: usize) -> Vec<PanelRect> {
+    let mut panels: Vec<PanelRect> = rects
+        .iter()
+        .map(|&(x, y, pw, ph)| PanelRect {
+            x: (x as f64 / sw as f64).clamp(0.0, 1.0),
+            y: (y as f64 / sh as f64).clamp(0.0, 1.0),
             w: (pw as f64 / sw as f64).clamp(0.04, 1.0),
             h: (ph as f64 / sh as f64).clamp(0.04, 1.0),
         })
-        .filter(|p| p.w * p.h >= 0.035)
+        .filter(|p| p.w * p.h >= 0.04)
         .collect();
-
-    // Drop tiny leftovers that look like figure crops.
-    if panels.len() > 2 {
-        panels.retain(|p| p.w * p.h >= 0.04);
+    // Snap near-full spans to true edges so PC fullscreen has no fake margin.
+    for p in &mut panels {
+        if p.x <= 0.02 {
+            p.w = (p.w + p.x).min(1.0);
+            p.x = 0.0;
+        }
+        if p.y <= 0.02 {
+            p.h = (p.h + p.y).min(1.0);
+            p.y = 0.0;
+        }
+        if p.x + p.w >= 0.98 {
+            p.w = 1.0 - p.x;
+        }
+        if p.y + p.h >= 0.98 {
+            p.h = 1.0 - p.y;
+        }
     }
     if panels.len() > 1 {
         let mut areas: Vec<f64> = panels.iter().map(|p| p.w * p.h).collect();
         areas.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
         let median_area = areas[areas.len() / 2];
-        panels.retain(|p| p.w * p.h >= median_area * 0.35);
+        panels.retain(|p| p.w * p.h >= median_area * 0.40);
     }
+    panels
+}
 
-    if panels.is_empty() {
-        full_page()
+fn looks_like_clean_grid(rects: &[(usize, usize, usize, usize)], w: usize, h: usize) -> bool {
+    let n = rects.len();
+    if n < 2 || n > 12 {
+        return false;
+    }
+    let page = (w * h) as f32;
+    let mut area = 0f32;
+    for &(_, _, pw, ph) in rects {
+        let a = (pw * ph) as f32;
+        if a / page < 0.045 {
+            return false;
+        }
+        let ar = pw as f32 / ph.max(1) as f32;
+        if !(0.4..=3.2).contains(&ar) {
+            return false;
+        }
+        area += a;
+    }
+    let coverage = area / page;
+    (0.55..=1.15).contains(&coverage)
+}
+
+/// Full-width horizontal bands only (no vertical splits).
+fn detect_row_slices(lum: &[u8], w: usize, h: usize, white: bool) -> Vec<(usize, usize, usize, usize)> {
+    let mut row_gutter = vec![false; h];
+    let mut row_buf = vec![0u8; w];
+    for y in 0..h {
+        for x in 0..w {
+            row_buf[x] = lum[y * w + x];
+        }
+        row_gutter[y] = line_is_gutter(&row_buf, white);
+    }
+    thicken_mask(&mut row_gutter, 1);
+    let bands = content_bands(&row_gutter, ((h as f32) * 0.05).max(12.0) as usize);
+    let min_h = ((h as f32) * 0.08).max(16.0) as usize;
+    let mut rects = Vec::new();
+    for &(y0, y1) in &bands {
+        let bh = y1.saturating_sub(y0);
+        if bh < min_h {
+            continue;
+        }
+        if cell_mostly_empty(lum, w, 0, y0, w, y1, white) {
+            continue;
+        }
+        // Edge-to-edge horizontally — full page width slice.
+        rects.push((0, y0, w, bh));
+    }
+    if rects.is_empty() {
+        vec![(0, 0, w, h)]
     } else {
-        panels
+        rects
     }
 }
 
@@ -147,7 +234,6 @@ fn detect_grid(lum: &[u8], w: usize, h: usize, white: bool) -> Vec<(usize, usize
 
     let min_w = ((w as f32) * 0.14).max(16.0) as usize;
     let min_h = ((h as f32) * 0.08).max(16.0) as usize;
-    let inset = ((w.min(h) as f32) * 0.004).max(1.0) as usize;
 
     let mut rects = Vec::new();
     for &(y0, y1) in &row_bands {
@@ -190,26 +276,17 @@ fn detect_grid(lum: &[u8], w: usize, h: usize, white: bool) -> Vec<(usize, usize
             if cell_mostly_empty(lum, w, x0, y0, x1, y1, white) {
                 continue;
             }
-            // Keep gutter-bounded cell; small inset only — do NOT tighten to ink
-            // (that was carving figures out of panels).
-            let tx = (x0 + inset).min(x1.saturating_sub(1));
-            let ty = (y0 + inset).min(y1.saturating_sub(1));
-            let tx1 = x1.saturating_sub(inset).max(tx + 1);
-            let ty1 = y1.saturating_sub(inset).max(ty + 1);
-            let tw = tx1 - tx;
-            let th = ty1 - ty;
+            // Edge-to-edge within the gutter cell — no inset/margin pad.
+            let tw = x1.saturating_sub(x0);
+            let th = y1.saturating_sub(y0);
             if tw >= min_w && th >= min_h {
-                row_rects.push((tx, ty, tw, th));
+                row_rects.push((x0, y0, tw, th));
             }
         }
 
         if row_rects.is_empty() {
             if !cell_mostly_empty(lum, w, 0, y0, w, y1, white) {
-                let tx = inset.min(w.saturating_sub(1));
-                let ty = (y0 + inset).min(y1.saturating_sub(1));
-                let tw = w.saturating_sub(inset * 2).max(min_w);
-                let th = y1.saturating_sub(ty + inset).max(min_h);
-                row_rects.push((tx, ty, tw.min(w - tx), th.min(h - ty)));
+                row_rects.push((0, y0, w, band_h));
             }
         }
 
@@ -391,18 +468,18 @@ fn cell_mostly_empty(
     false
 }
 
-fn pick_better(
+fn pick_better_scored(
     a: Vec<(usize, usize, usize, usize)>,
     b: Vec<(usize, usize, usize, usize)>,
     w: usize,
     h: usize,
-) -> Vec<(usize, usize, usize, usize)> {
+) -> (Vec<(usize, usize, usize, usize)>, f32) {
     let sa = score(&a, w, h);
     let sb = score(&b, w, h);
     if sa >= sb {
-        a
+        (a, sa)
     } else {
-        b
+        (b, sb)
     }
 }
 
