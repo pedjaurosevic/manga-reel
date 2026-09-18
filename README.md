@@ -1,19 +1,19 @@
 # Manga Reel
 
-**Manga Reel** is an open-source **panel-by-panel** CBZ/CBR comic reader for Linux (Rust + GTK4 + libadwaita).
+**Manga Reel** is an open-source CBZ/CBR comic reader for Linux (Rust + GTK4 + libadwaita).
 
-Instead of page-first reading, Manga Reel frames each panel so you can step through manga and comics like a guided reel — with film-strip auto-advance and vertical modes.
+Fullscreen page reading with smooth pan, toggleable chrome, and seamless autoscroll.
 
-## Features (v1)
+## Features
 
 - Open **CBZ** (zip) and **CBR** (rar via `unrar` CLI)
-- **Panel detection** (classical gutter / projection heuristics; no ML)
-- Panel cache in sidecar `.manga-reel.json` or `~/.cache/manga-reel/`
-- Reader: step panels, **black/white letterbox**, **LTR/RTL** order
-- Modes: **guided**, **horizontal film-strip** (adjustable speed), **vertical** scroll-step
-- Library: pick folder, recursive CBZ/CBR scan, remember progress in `~/.local/share/manga-reel/`
-- Manual panel **edit** (add / move / resize / delete / save)
-- Keyboard shortcuts, `.desktop` launcher, MIME defaults for CBZ/CBR
+- Fullscreen **full-page** view (fit width / height / page)
+- Smooth pan: arrows, WASD, drag, scroll wheel; page-turn at pan edges
+- **LTR / RTL** page-turn direction
+- **Double-click** (or `T`) toggles toolbar + status while reading
+- **Autoscroll** (`Space` or **Auto** button) on a continuous vertical page strip — no visible hard cut at page boundaries
+- Library folder scan; progress in `~/.local/share/manga-reel/`
+- `.desktop` launcher + MIME defaults for CBZ/CBR
 
 ## Build
 
@@ -28,44 +28,35 @@ git clone git@github.com:pedjaurosevic/manga-reel.git ~/src/manga-reel
 cd ~/src/manga-reel
 python3 scripts/bootstrap-assets.py   # icons + sample CBZ
 cargo build --release
-cargo run --release
-# or open a file directly:
 cargo run --release -- testdata/sample-panels.cbz
 ```
 
-## Install (launcher + MIME + PATH)
-
-After a release build:
+## Install
 
 ```bash
 ./scripts/install-desktop.sh
 ```
 
-This will:
-
-1. Symlink the binary to `~/.local/bin/manga-reel`
-2. Install icons under `~/.local/share/icons/hicolor/*/apps/manga-reel.png`
-3. Install `~/.local/share/applications/manga-reel.desktop` (`Icon=manga-reel`, `Exec=… %F`)
-4. Register as default handler for CBZ/CBR MIME types
-5. Run `update-desktop-database` / icon cache updates
-
-Then:
-
-- **Super+Space** (Omarchy) → type “Manga Reel”
-- Double-click a `.cbz` / `.cbr` file
-- CLI: `manga-reel /path/to/file.cbz`
+Symlinks `~/.local/bin/manga-reel`, installs icons + desktop entry, registers CBZ/CBR MIME.
 
 ## Shortcuts (reader)
 
-| Key | Action |
-|-----|--------|
-| `→` / `Space` / `D` / `J` | Next panel |
-| `←` / `A` / `K` | Previous panel |
-| Scroll wheel | Next / previous |
-| `Delete` | Delete panel (edit mode) |
-| `Esc` | Exit edit mode |
+| Key / action | What it does |
+|--------------|--------------|
+| `→` `D` `L` | Pan right (turn page at edge; RTL-aware) |
+| `←` `A` `H` | Pan left |
+| `↓` `J` `PageDown` | Pan down |
+| `↑` `K` `PageUp` | Pan up |
+| **Space** | Toggle **autoscroll** |
+| **Double-click** / `T` | Toggle toolbar + status (chrome) |
+| Drag | Pan (pauses autoscroll) |
+| Scroll wheel | Pan vertically (pauses autoscroll) |
+| `F11` | Toggle fullscreen |
+| `Esc` | Exit fullscreen |
 
-Toolbar toggles: RTL/LTR, letterbox, Guided / Film strip / Vertical, Edit.
+Toolbar: previous/next, Fit width/height/page, LTR/RTL, letterbox, **Auto**.
+
+Autoscroll uses a **continuous vertical strip** (current page + preloaded next/prev). Crossing a page boundary rewires the strip offset so you never see a hard page swap.
 
 ## License
 
