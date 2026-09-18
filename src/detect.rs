@@ -1,5 +1,8 @@
-//! Classical panel detection: projection gutters + per-row splits + content tighten.
-//! Version 2 — better than the global grid approach for irregular comic layouts.
+//! Italian-style comic panel detection (v3).
+//!
+//! Finds gutter-bounded rectangular frames (often 2 per row). Prefers full
+//! row/column gutters and refuses recursive content splits that carve figures
+//! out of the inside of a panel.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +14,7 @@ pub struct PanelRect {
     pub h: f64,
 }
 
-const CACHE_NOTE: u32 = 2;
+const CACHE_NOTE: u32 = 3;
 #[allow(dead_code)]
 pub const DETECT_VERSION: u32 = CACHE_NOTE;
 
@@ -23,32 +26,33 @@ pub fn detect_panels(rgba: &[u8], width: u32, height: u32) -> Vec<PanelRect> {
 
     let w = width as usize;
     let h = height as usize;
+    let (sw, sh, lum) = downsample_luma(rgba, w, h, 1200);
 
-    let max_side = 1400usize;
-    let (sw, sh, lum) = downsample_luma(rgba, w, h, max_side);
+    let white = detect_grid(&lum, sw, sh, true);
+    let dark = detect_grid(&lum, sw, sh, false);
+    let best = pick_better(white, dark, sw, sh);
 
-    let white = detect_layout(&lum, sw, sh, true);
-    let dark = detect_layout(&lum, sw, sh, false);
-    let mut best = pick_better(white, dark, sw, sh);
-
-    if best.len() < 2 {
-        // Last resort: recursive median-split on content
-        let split = recursive_split(&lum, sw, sh, 0, 0, sw, sh, 0);
-        if split.len() > best.len() {
-            best = split;
-        }
-    }
-
-    let panels: Vec<PanelRect> = best
+    let mut panels: Vec<PanelRect> = best
         .into_iter()
         .map(|(x, y, pw, ph)| PanelRect {
             x: x as f64 / sw as f64,
             y: y as f64 / sh as f64,
-            w: (pw as f64 / sw as f64).clamp(0.02, 1.0),
-            h: (ph as f64 / sh as f64).clamp(0.02, 1.0),
+            w: (pw as f64 / sw as f64).clamp(0.04, 1.0),
+            h: (ph as f64 / sh as f64).clamp(0.04, 1.0),
         })
-        .filter(|p| p.w * p.h >= 0.008)
+        .filter(|p| p.w * p.h >= 0.035)
         .collect();
+
+    // Drop tiny leftovers that look like figure crops.
+    if panels.len() > 2 {
+        panels.retain(|p| p.w * p.h >= 0.04);
+    }
+    if panels.len() > 1 {
+        let mut areas: Vec<f64> = panels.iter().map(|p| p.w * p.h).collect();
+        areas.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        let median_area = areas[areas.len() / 2];
+        panels.retain(|p| p.w * p.h >= median_area * 0.35);
+    }
 
     if panels.is_empty() {
         full_page()
@@ -96,42 +100,86 @@ fn downsample_luma(rgba: &[u8], w: usize, h: usize, max_side: usize) -> (usize, 
     (nw, nh, out)
 }
 
-fn detect_layout(lum: &[u8], w: usize, h: usize, white_gutters: bool) -> Vec<(usize, usize, usize, usize)> {
-    // Full-page row means → horizontal gutters → content bands
-    let mut row_mean = vec![0f32; h];
-    for y in 0..h {
-        let mut s = 0u32;
-        for x in 0..w {
-            s += lum[y * w + x] as u32;
-        }
-        row_mean[y] = s as f32 / w as f32;
+/// True when this line is a gutter across most of its length (not just average).
+fn line_is_gutter(samples: &[u8], white: bool) -> bool {
+    if samples.is_empty() {
+        return false;
     }
+    let n = samples.len() as f32;
+    let (hi, lo) = if white {
+        (235u8, 210u8)
+    } else {
+        (45u8, 25u8)
+    };
+    let mut strong = 0u32;
+    let mut soft = 0u32;
+    for &v in samples {
+        if white {
+            if v >= hi {
+                strong += 1;
+            } else if v >= lo {
+                soft += 1;
+            }
+        } else if v <= lo {
+            strong += 1;
+        } else if v <= hi {
+            soft += 1;
+        }
+    }
+    // Require a clear majority of true gutter pixels so inked figures don't
+    // create fake splits inside a panel.
+    let ratio = (strong as f32 + soft as f32 * 0.45) / n;
+    ratio >= 0.78 && strong as f32 / n >= 0.45
+}
 
-    let row_gutter = mark_gutters_adaptive(&row_mean, white_gutters);
-    let row_bands = bands_from_mask(&row_gutter, (h as f32 * 0.03) as usize);
+fn detect_grid(lum: &[u8], w: usize, h: usize, white: bool) -> Vec<(usize, usize, usize, usize)> {
+    // Horizontal gutters: rows that are gutter-colored across most of the width.
+    let mut row_gutter = vec![false; h];
+    let mut row_buf = vec![0u8; w];
+    for y in 0..h {
+        for x in 0..w {
+            row_buf[x] = lum[y * w + x];
+        }
+        row_gutter[y] = line_is_gutter(&row_buf, white);
+    }
+    thicken_mask(&mut row_gutter, 1);
+    let row_bands = content_bands(&row_gutter, ((h as f32) * 0.04).max(10.0) as usize);
 
-    let min_w = ((w as f32) * 0.06).max(8.0) as usize;
-    let min_h = ((h as f32) * 0.045).max(8.0) as usize;
+    let min_w = ((w as f32) * 0.14).max(16.0) as usize;
+    let min_h = ((h as f32) * 0.08).max(16.0) as usize;
+    let inset = ((w.min(h) as f32) * 0.004).max(1.0) as usize;
 
     let mut rects = Vec::new();
-
     for &(y0, y1) in &row_bands {
         let band_h = y1.saturating_sub(y0);
         if band_h < min_h {
             continue;
         }
 
-        // Per-row column projection (key improvement vs global grid)
-        let mut col_mean = vec![0f32; w];
+        let mut col_gutter = vec![false; w];
+        let mut col_buf = vec![0u8; band_h];
         for x in 0..w {
-            let mut s = 0u32;
-            for y in y0..y1 {
-                s += lum[y * w + x] as u32;
+            for (i, y) in (y0..y1).enumerate() {
+                col_buf[i] = lum[y * w + x];
             }
-            col_mean[x] = s as f32 / band_h as f32;
+            col_gutter[x] = line_is_gutter(&col_buf, white);
         }
-        let col_gutter = mark_gutters_adaptive(&col_mean, white_gutters);
-        let col_bands = bands_from_mask(&col_gutter, (w as f32 * 0.02) as usize);
+        // Ignore outer margins as "gutters" for splitting — keep as page edge.
+        let margin = ((w as f32) * 0.03) as usize;
+        for i in 0..margin.min(w) {
+            col_gutter[i] = false;
+            col_gutter[w - 1 - i] = false;
+        }
+        thicken_mask(&mut col_gutter, 1);
+
+        let mut col_bands = content_bands(&col_gutter, ((w as f32) * 0.08).max(12.0) as usize);
+        // Italian pages: prefer at most 3 panels per row; if we got too many,
+        // keep the widest bands only (false gutters from figures).
+        if col_bands.len() > 3 {
+            col_bands.sort_by_key(|&(a, b)| std::cmp::Reverse(b.saturating_sub(a)));
+            col_bands.truncate(3);
+            col_bands.sort_by_key(|&(a, _)| a);
+        }
 
         let mut row_rects = Vec::new();
         for &(x0, x1) in &col_bands {
@@ -139,39 +187,40 @@ fn detect_layout(lum: &[u8], w: usize, h: usize, white_gutters: bool) -> Vec<(us
             if pw < min_w {
                 continue;
             }
-            if cell_is_empty(lum, w, x0, y0, x1, y1, white_gutters) {
+            if cell_mostly_empty(lum, w, x0, y0, x1, y1, white) {
                 continue;
             }
-            // Tighten to actual ink/content
-            if let Some((tx, ty, tw, th)) = tighten(lum, w, h, x0, y0, x1, y1, white_gutters) {
-                if tw >= min_w && th >= min_h {
-                    row_rects.push((tx, ty, tw, th));
-                }
-            } else {
-                row_rects.push((x0, y0, pw, band_h));
+            // Keep gutter-bounded cell; small inset only — do NOT tighten to ink
+            // (that was carving figures out of panels).
+            let tx = (x0 + inset).min(x1.saturating_sub(1));
+            let ty = (y0 + inset).min(y1.saturating_sub(1));
+            let tx1 = x1.saturating_sub(inset).max(tx + 1);
+            let ty1 = y1.saturating_sub(inset).max(ty + 1);
+            let tw = tx1 - tx;
+            let th = ty1 - ty;
+            if tw >= min_w && th >= min_h {
+                row_rects.push((tx, ty, tw, th));
             }
         }
 
         if row_rects.is_empty() {
-            // Whole band as one panel if it has content
-            if !cell_is_empty(lum, w, 0, y0, w, y1, white_gutters) {
-                if let Some((tx, ty, tw, th)) = tighten(lum, w, h, 0, y0, w, y1, white_gutters) {
-                    if tw >= min_w && th >= min_h {
-                        row_rects.push((tx, ty, tw, th));
-                    }
-                } else {
-                    row_rects.push((0, y0, w, band_h));
-                }
+            if !cell_mostly_empty(lum, w, 0, y0, w, y1, white) {
+                let tx = inset.min(w.saturating_sub(1));
+                let ty = (y0 + inset).min(y1.saturating_sub(1));
+                let tw = w.saturating_sub(inset * 2).max(min_w);
+                let th = y1.saturating_sub(ty + inset).max(min_h);
+                row_rects.push((tx, ty, tw.min(w - tx), th.min(h - ty)));
             }
         }
 
-        // If a "panel" is still very wide, try one more vertical split inside it
+        // If one very wide cell remains and a strong mid gutter exists, split once.
         let mut refined = Vec::new();
         for (x, y, pw, ph) in row_rects {
-            if pw as f32 > w as f32 * 0.72 && ph as f32 > h as f32 * 0.12 {
-                let extra = split_vertically(lum, w, h, x, y, x + pw, y + ph, white_gutters, min_w);
-                if extra.len() >= 2 {
-                    refined.extend(extra);
+            if pw as f32 > w as f32 * 0.70 && ph as f32 > h as f32 * 0.10 {
+                if let Some((left, right)) = try_binary_vertical_split(lum, w, x, y, x + pw, y + ph, white, min_w)
+                {
+                    refined.push(left);
+                    refined.push(right);
                     continue;
                 }
             }
@@ -187,7 +236,7 @@ fn detect_layout(lum: &[u8], w: usize, h: usize, white_gutters: bool) -> Vec<(us
     rects.sort_by(|a, b| {
         let ay = a.1 + a.3 / 2;
         let by = b.1 + b.3 / 2;
-        let row_tol = (h as f32 * 0.04) as usize;
+        let row_tol = (h as f32 * 0.05) as usize;
         if ay.abs_diff(by) <= row_tol {
             a.0.cmp(&b.0)
         } else {
@@ -198,112 +247,86 @@ fn detect_layout(lum: &[u8], w: usize, h: usize, white_gutters: bool) -> Vec<(us
     merge_overlaps(rects)
 }
 
-fn split_vertically(
+fn try_binary_vertical_split(
     lum: &[u8],
     stride: usize,
-    page_h: usize,
     x0: usize,
     y0: usize,
     x1: usize,
     y1: usize,
     white: bool,
     min_w: usize,
-) -> Vec<(usize, usize, usize, usize)> {
+) -> Option<((usize, usize, usize, usize), (usize, usize, usize, usize))> {
     let bw = x1.saturating_sub(x0);
     let bh = y1.saturating_sub(y0);
     if bw < min_w * 2 || bh < 8 {
-        return vec![];
+        return None;
     }
-    let mut col_mean = vec![0f32; bw];
-    for i in 0..bw {
-        let mut s = 0u32;
-        for y in y0..y1 {
-            s += lum[y * stride + (x0 + i)] as u32;
+    let margin = ((bw as f32) * 0.18) as usize;
+    let mut best: Option<(usize, f32)> = None;
+    let mut col_buf = vec![0u8; bh];
+    for i in margin..(bw.saturating_sub(margin)) {
+        for (k, y) in (y0..y1).enumerate() {
+            col_buf[k] = lum[y * stride + (x0 + i)];
         }
-        col_mean[i] = s as f32 / bh as f32;
-    }
-    let mut g = mark_gutters_adaptive(&col_mean, white);
-    let margin = ((bw as f32) * 0.08) as usize;
-    for i in 0..margin.min(bw) {
-        g[i] = false;
-        g[bw - 1 - i] = false;
-    }
-    let bands = bands_from_mask(&g, ((bw as f32) * 0.03) as usize);
-    let mut out = Vec::new();
-    for &(a, b) in &bands {
-        let pw = b.saturating_sub(a);
-        if pw < min_w {
+        if !line_is_gutter(&col_buf, white) {
             continue;
         }
-        let gx0 = x0 + a;
-        let gx1 = x0 + b;
-        if cell_is_empty(lum, stride, gx0, y0, gx1, y1, white) {
-            continue;
+        // Prefer gutters near the horizontal center for 2-up Italian rows.
+        let center = bw as f32 / 2.0;
+        let dist = (i as f32 - center).abs() / center;
+        let score = 1.0 - dist;
+        if best.map(|(_, s)| score > s).unwrap_or(true) {
+            best = Some((i, score));
         }
-        if let Some(t) = tighten(lum, stride, page_h, gx0, y0, gx1, y1, white) {
-            out.push(t);
+    }
+    let (cut, _) = best?;
+    // Expand cut to full gutter run
+    let mut a = cut;
+    let mut b = cut + 1;
+    while a > margin {
+        for (k, y) in (y0..y1).enumerate() {
+            col_buf[k] = lum[y * stride + (x0 + a - 1)];
+        }
+        if line_is_gutter(&col_buf, white) {
+            a -= 1;
         } else {
-            out.push((gx0, y0, pw, bh));
+            break;
         }
     }
-    out
+    while b < bw.saturating_sub(margin) {
+        for (k, y) in (y0..y1).enumerate() {
+            col_buf[k] = lum[y * stride + (x0 + b)];
+        }
+        if line_is_gutter(&col_buf, white) {
+            b += 1;
+        } else {
+            break;
+        }
+    }
+    let left_w = a;
+    let right_x = b;
+    let right_w = bw.saturating_sub(right_x);
+    if left_w < min_w || right_w < min_w {
+        return None;
+    }
+    Some((
+        (x0, y0, left_w, bh),
+        (x0 + right_x, y0, right_w, bh),
+    ))
 }
 
-fn mark_gutters_adaptive(means: &[f32], white: bool) -> Vec<bool> {
-    let n = means.len();
-    let mut mask = vec![false; n];
-    if n == 0 {
-        return mask;
-    }
-    let mut sorted = means.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p10 = sorted[(n as f32 * 0.10) as usize];
-    let p50 = sorted[n / 2];
-    let p90 = sorted[(n as f32 * 0.90) as usize];
-
-    let threshold = if white {
-        // Gutters near the bright end; require separation from midtones
-        let t = (p90 * 0.55 + p50 * 0.45).max(p50 + 18.0);
-        t.clamp(170.0, 248.0)
-    } else {
-        let t = (p10 * 0.55 + p50 * 0.45).min(p50 - 18.0);
-        t.clamp(8.0, 90.0)
-    };
-
-    for (i, &m) in means.iter().enumerate() {
-        mask[i] = if white { m >= threshold } else { m <= threshold };
-    }
-
-    // Soften: fill tiny non-gutter holes inside gutters and vice versa
-    dilate_erode(&mut mask, 1);
-    // Expand gutters slightly so thin lines count
-    let eroded = mask.clone();
-    let radius = 1usize;
-    for i in 0..n {
-        let lo = i.saturating_sub(radius);
-        let hi = (i + radius + 1).min(n);
-        mask[i] = eroded[lo..hi].iter().any(|&v| v);
-    }
-    mask
-}
-
-fn dilate_erode(mask: &mut [bool], radius: usize) {
+fn thicken_mask(mask: &mut [bool], radius: usize) {
     let n = mask.len();
     let orig = mask.to_vec();
     for i in 0..n {
         let lo = i.saturating_sub(radius);
         let hi = (i + radius + 1).min(n);
-        mask[i] = orig[lo..hi].iter().all(|&v| v);
-    }
-    let eroded = mask.to_vec();
-    for i in 0..n {
-        let lo = i.saturating_sub(radius);
-        let hi = (i + radius + 1).min(n);
-        mask[i] = eroded[lo..hi].iter().any(|&v| v);
+        mask[i] = orig[lo..hi].iter().any(|&v| v);
     }
 }
 
-fn bands_from_mask(gutter: &[bool], min_len: usize) -> Vec<(usize, usize)> {
+fn content_bands(gutter: &[bool], min_len: usize) -> Vec<(usize, usize)> {
     let n = gutter.len();
     let mut bands = Vec::new();
     let mut i = 0;
@@ -328,7 +351,7 @@ fn bands_from_mask(gutter: &[bool], min_len: usize) -> Vec<(usize, usize)> {
     bands
 }
 
-fn cell_is_empty(
+fn cell_mostly_empty(
     lum: &[u8],
     w: usize,
     x0: usize,
@@ -343,8 +366,7 @@ fn cell_is_empty(
     let step = 3usize;
     for y in (y0..y1).step_by(step) {
         for x in (x0..x1).step_by(step) {
-            let v = lum[y * w + x] as u64;
-            sum += v;
+            sum += lum[y * w + x] as u64;
             count += 1;
         }
     }
@@ -359,147 +381,14 @@ fn cell_is_empty(
         }
     }
     let std = (var_acc / count as f64).sqrt();
-    // Empty gutter-like cells: uniform and extreme luminance
-    if std < 8.0 {
+    if std < 10.0 {
         if white_gutter {
-            return mean > 238.0;
+            return mean > 235.0;
         } else {
-            return mean < 18.0;
+            return mean < 22.0;
         }
     }
     false
-}
-
-/// Shrink rect to bounding box of non-gutter content pixels.
-fn tighten(
-    lum: &[u8],
-    w: usize,
-    h: usize,
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
-    white_gutter: bool,
-) -> Option<(usize, usize, usize, usize)> {
-    let x1 = x1.min(w);
-    let y1 = y1.min(h);
-    if x0 >= x1 || y0 >= y1 {
-        return None;
-    }
-    let mut min_x = x1;
-    let mut min_y = y1;
-    let mut max_x = x0;
-    let mut max_y = y0;
-    let step = 2usize;
-    for y in (y0..y1).step_by(step) {
-        for x in (x0..x1).step_by(step) {
-            let v = lum[y * w + x];
-            let is_gutter = if white_gutter { v >= 245 } else { v <= 12 };
-            if !is_gutter {
-                min_x = min_x.min(x);
-                min_y = min_y.min(y);
-                max_x = max_x.max(x);
-                max_y = max_y.max(y);
-            }
-        }
-    }
-    if max_x <= min_x || max_y <= min_y {
-        return None;
-    }
-    // Small pad
-    let pad = 2usize;
-    let tx = min_x.saturating_sub(pad).max(x0);
-    let ty = min_y.saturating_sub(pad).max(y0);
-    let tx1 = (max_x + pad + 1).min(x1);
-    let ty1 = (max_y + pad + 1).min(y1);
-    Some((tx, ty, tx1 - tx, ty1 - ty))
-}
-
-fn recursive_split(
-    lum: &[u8],
-    w: usize,
-    h: usize,
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
-    depth: usize,
-) -> Vec<(usize, usize, usize, usize)> {
-    let pw = x1.saturating_sub(x0);
-    let ph = y1.saturating_sub(y0);
-    if depth > 4 || pw < (w as f32 * 0.12) as usize || ph < (h as f32 * 0.10) as usize {
-        return vec![(x0, y0, pw, ph)];
-    }
-
-    // Prefer splitting along the stronger gutter axis
-    let mut row_mean = vec![0f32; ph];
-    for i in 0..ph {
-        let mut s = 0u32;
-        for x in x0..x1 {
-            s += lum[(y0 + i) * w + x] as u32;
-        }
-        row_mean[i] = s as f32 / pw as f32;
-    }
-    let mut col_mean = vec![0f32; pw];
-    for i in 0..pw {
-        let mut s = 0u32;
-        for y in y0..y1 {
-            s += lum[y * w + (x0 + i)] as u32;
-        }
-        col_mean[i] = s as f32 / ph as f32;
-    }
-
-    let (split_row, row_score) = best_gutter_cut(&row_mean);
-    let (split_col, col_score) = best_gutter_cut(&col_mean);
-
-    if row_score < 12.0 && col_score < 12.0 {
-        return vec![(x0, y0, pw, ph)];
-    }
-
-    if row_score >= col_score {
-        let mid = y0 + split_row;
-        if mid <= y0 + 4 || mid >= y1.saturating_sub(4) {
-            return vec![(x0, y0, pw, ph)];
-        }
-        let mut a = recursive_split(lum, w, h, x0, y0, x1, mid, depth + 1);
-        let b = recursive_split(lum, w, h, x0, mid, x1, y1, depth + 1);
-        a.extend(b);
-        a
-    } else {
-        let mid = x0 + split_col;
-        if mid <= x0 + 4 || mid >= x1.saturating_sub(4) {
-            return vec![(x0, y0, pw, ph)];
-        }
-        let mut a = recursive_split(lum, w, h, x0, y0, mid, y1, depth + 1);
-        let b = recursive_split(lum, w, h, mid, y0, x1, y1, depth + 1);
-        a.extend(b);
-        a
-    }
-}
-
-fn best_gutter_cut(means: &[f32]) -> (usize, f32) {
-    let n = means.len();
-    if n < 16 {
-        return (n / 2, 0.0);
-    }
-    let avg = means.iter().sum::<f32>() / n as f32;
-    let mut best_i = n / 2;
-    let mut best_score = 0f32;
-    let lo = n / 5;
-    let hi = n - n / 5;
-    for i in lo..hi {
-        // Bright or dark spike relative to neighbors = gutter
-        let m = means[i];
-        let local = (means[i.saturating_sub(2)] + means[(i + 2).min(n - 1)]) * 0.5;
-        let bright = m - local;
-        let dark = local - m;
-        let score = bright.max(dark) + (m - avg).abs() * 0.15;
-        if score > best_score {
-            best_score = score;
-            best_i = i;
-        }
-    }
-    (best_i, best_score)
 }
 
 fn pick_better(
@@ -508,7 +397,9 @@ fn pick_better(
     w: usize,
     h: usize,
 ) -> Vec<(usize, usize, usize, usize)> {
-    if score(&a, w, h) >= score(&b, w, h) {
+    let sa = score(&a, w, h);
+    let sb = score(&b, w, h);
+    if sa >= sb {
         a
     } else {
         b
@@ -520,28 +411,35 @@ fn score(rects: &[(usize, usize, usize, usize)], w: usize, h: usize) -> f32 {
         return 0.0;
     }
     let page = (w * h) as f32;
-    let mut cover = 0f32;
-    let mut good = 0f32;
+    let mut area = 0f32;
+    let mut shape = 0f32;
+    let mut tiny_pen = 0f32;
     for &(x, y, pw, ph) in rects {
-        let area = (pw * ph) as f32;
-        cover += area;
-        let ar = pw as f32 / ph.max(1) as f32;
-        // Prefer comic-like aspect ratios
-        if (0.35..=3.5).contains(&ar) && area / page >= 0.02 && area / page <= 0.85 {
-            good += 1.0;
+        let _ = (x, y);
+        let a = (pw * ph) as f32;
+        area += a;
+        let ar = pw as f32 / ph as f32;
+        // Italian panels are usually wider or roughly square — not ultra-thin.
+        if (0.45..=2.8).contains(&ar) {
+            shape += 1.0;
+        } else {
+            shape -= 0.5;
+        }
+        if a / page < 0.04 {
+            tiny_pen += 1.5;
         }
     }
     let n = rects.len() as f32;
-    // Reward multiple panels, good shapes, and reasonable coverage (not 1 huge page)
-    let cover_ratio = (cover / page).min(1.2);
-    let cover_score = if cover_ratio < 0.35 {
-        cover_ratio
-    } else if cover_ratio > 1.05 {
-        0.5
+    let coverage = (area / page).clamp(0.0, 1.2);
+    // Sweet spot: 2–12 panels, good coverage, few tiny fragments.
+    let count_score = if (2.0..=12.0).contains(&n) {
+        3.0 + (1.0 - (n - 6.0).abs() / 6.0)
+    } else if n == 1.0 {
+        0.8
     } else {
-        1.0
+        0.2
     };
-    good * 2.0 + n.min(12.0) + cover_score * 3.0 - if n <= 1.0 { 4.0 } else { 0.0 }
+    count_score + shape + coverage * 2.5 - tiny_pen
 }
 
 fn merge_overlaps(rects: Vec<(usize, usize, usize, usize)>) -> Vec<(usize, usize, usize, usize)> {
@@ -549,11 +447,11 @@ fn merge_overlaps(rects: Vec<(usize, usize, usize, usize)>) -> Vec<(usize, usize
     for r in rects {
         let mut merged = false;
         for o in out.iter_mut() {
-            if overlap_ratio(r, *o) > 0.65 {
-                let x0 = o.0.min(r.0);
-                let y0 = o.1.min(r.1);
-                let x1 = (o.0 + o.2).max(r.0 + r.2);
-                let y1 = (o.1 + o.3).max(r.1 + r.3);
+            if overlap_ratio(r, *o) > 0.55 {
+                let x0 = r.0.min(o.0);
+                let y0 = r.1.min(o.1);
+                let x1 = (r.0 + r.2).max(o.0 + o.2);
+                let y1 = (r.1 + r.3).max(o.1 + o.3);
                 *o = (x0, y0, x1 - x0, y1 - y0);
                 merged = true;
                 break;
@@ -579,9 +477,12 @@ fn overlap_ratio(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
         return 0.0;
     }
     let inter = ((ix1 - ix0) * (iy1 - iy0)) as f32;
-    let area_a = (a.2 * a.3) as f32;
-    let area_b = (b.2 * b.3) as f32;
-    inter / area_a.min(area_b).max(1.0)
+    let union = (a.2 * a.3 + b.2 * b.3) as f32 - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
 }
 
 /// Reorder panels for RTL (manga): top-to-bottom, right-to-left within rows.
@@ -604,4 +505,16 @@ pub fn order_panels(panels: &[PanelRect], rtl: bool) -> Vec<PanelRect> {
         }
     });
     indexed.into_iter().map(|(_, p)| p).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_page_fallback_on_tiny() {
+        let rgba = vec![0u8; 4];
+        let p = detect_panels(&rgba, 1, 1);
+        assert_eq!(p.len(), 1);
+    }
 }
