@@ -38,7 +38,13 @@ pub struct Settings {
     pub fit: FitMode,
     /// Keyboard pan step as fraction of viewport (0.05–0.5).
     pub pan_step: f64,
+    /// Autoscroll speed in pixels per second (slow continuous strip).
+    #[serde(default = "default_autoscroll_pps")]
+    pub autoscroll_pps: f64,
 }
+
+fn default_autoscroll_pps() -> f64 { 48.0 }
+
 
 impl Default for Settings {
     fn default() -> Self {
@@ -47,6 +53,7 @@ impl Default for Settings {
             letterbox: Letterbox::Black,
             fit: FitMode::Width,
             pan_step: 0.18,
+            autoscroll_pps: 48.0,
         }
     }
 }
@@ -59,10 +66,15 @@ fn settings_path() -> PathBuf {
 
 pub fn load() -> Settings {
     let path = settings_path();
-    match fs::read_to_string(path) {
+    let mut s = match fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
         Err(_) => Settings::default(),
+    };
+    if !s.autoscroll_pps.is_finite() {
+        s.autoscroll_pps = 48.0;
     }
+    s.autoscroll_pps = s.autoscroll_pps.clamp(12.0, 240.0);
+    s
 }
 
 pub fn save(settings: &Settings) -> Result<()> {

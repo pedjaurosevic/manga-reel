@@ -61,3 +61,6 @@ Autoscroll uses a **continuous vertical strip** (current page + preloaded next/p
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+While **Auto** is on, the toolbar shows ↓ / ↑ and a `px/s` label to change autoscroll speed (also `-` / `+` keys). Speed is saved.

@@ -34,7 +34,9 @@ struct ReaderState {
     autoscroll: bool,
 }
 
-const AUTOSCROLL_PPS: f64 = 48.0;
+const AUTOSCROLL_PPS_MIN: f64 = 12.0;
+const AUTOSCROLL_PPS_MAX: f64 = 240.0;
+const AUTOSCROLL_PPS_STEP: f64 = 12.0;
 
 fn page_layout(fit: FitMode, pw: f64, ph: f64, vw: f64, vh: f64) -> (f64, f64, f64) {
     let scale = match fit {
@@ -105,6 +107,21 @@ pub fn open_reader(
     letter_btn.set_tooltip_text(Some("Letterbox black / white"));
     let auto_btn = ToggleButton::with_label("Auto");
     auto_btn.set_tooltip_text(Some("Autoscroll (Space) — seamless continuous strip"));
+
+    let speed_box = GtkBox::new(Orientation::Horizontal, 2);
+    speed_box.set_tooltip_text(Some("Autoscroll speed (only while Auto is on)"));
+    let slower_btn = Button::from_icon_name("go-down-symbolic");
+    slower_btn.set_tooltip_text(Some("Slower autoscroll (−)"));
+    let faster_btn = Button::from_icon_name("go-up-symbolic");
+    faster_btn.set_tooltip_text(Some("Faster autoscroll (+)"));
+    let speed_label = Label::new(Some("48 px/s"));
+    speed_label.add_css_class("dim-label");
+    speed_label.set_width_chars(8);
+    speed_box.append(&slower_btn);
+    speed_box.append(&speed_label);
+    speed_box.append(&faster_btn);
+    speed_box.set_visible(false);
+
     let fit_drop = DropDown::from_strings(&["Fit width", "Fit height", "Fit page"]);
     fit_drop.set_tooltip_text(Some("How the page fills the screen"));
 
@@ -115,6 +132,7 @@ pub fn open_reader(
     header.pack_start(&next_btn);
     header.pack_end(&letter_btn);
     header.pack_end(&order_btn);
+    header.pack_end(&speed_box);
     header.pack_end(&auto_btn);
     header.pack_end(&fit_drop);
 
@@ -490,17 +508,50 @@ pub fn open_reader(
         })
     };
 
+    let sync_speed_ui = {
+        let rs = rs.clone();
+        let speed_label = speed_label.clone();
+        let speed_box = speed_box.clone();
+        let autoscroll_on = autoscroll_on.clone();
+        Rc::new(move || {
+            speed_box.set_visible(autoscroll_on.get());
+            let pps = rs
+                .borrow()
+                .as_ref()
+                .map(|s| s.settings.autoscroll_pps)
+                .unwrap_or(48.0);
+            speed_label.set_text(&format!("{:.0} px/s", pps));
+        })
+    };
+    sync_speed_ui();
+
+    let bump_autoscroll_speed = {
+        let rs = rs.clone();
+        let sync_speed_ui = sync_speed_ui.clone();
+        Rc::new(move |delta: f64| {
+            if let Some(st) = rs.borrow_mut().as_mut() {
+                let next = (st.settings.autoscroll_pps + delta)
+                    .clamp(AUTOSCROLL_PPS_MIN, AUTOSCROLL_PPS_MAX);
+                st.settings.autoscroll_pps = next;
+                let _ = settings::save(&st.settings);
+            }
+            sync_speed_ui();
+        })
+    };
+
     let set_autoscroll = {
         let rs = rs.clone();
         let autoscroll_on = autoscroll_on.clone();
         let auto_btn = auto_btn.clone();
         let redraw = redraw.clone();
         let refresh_neighbors = refresh_neighbors.clone();
+        let sync_speed_ui = sync_speed_ui.clone();
         Rc::new(move |on: bool| {
             autoscroll_on.set(on);
             if let Some(st) = rs.borrow_mut().as_mut() { st.autoscroll = on; }
             if auto_btn.is_active() != on { auto_btn.set_active(on); }
             if on { refresh_neighbors(); }
+            sync_speed_ui();
             redraw();
         })
     };
@@ -524,7 +575,8 @@ pub fn open_reader(
                 None => 1.0 / 60.0,
             };
             last.set(Some(now));
-            let dy = AUTOSCROLL_PPS * dt;
+            let pps = rs.borrow().as_ref().map(|s| s.settings.autoscroll_pps).unwrap_or(48.0);
+            let dy = pps * dt;
             let (_max_x, min_y, max_y) = strip_limits();
             let mut borrow = rs.borrow_mut();
             let Some(st) = borrow.as_mut() else { return glib::ControlFlow::Continue; };
@@ -555,6 +607,14 @@ pub fn open_reader(
     {
         let set_autoscroll = set_autoscroll.clone();
         auto_btn.connect_toggled(move |btn| set_autoscroll(btn.is_active()));
+    }
+    {
+        let bump = bump_autoscroll_speed.clone();
+        slower_btn.connect_clicked(move |_| bump(-AUTOSCROLL_PPS_STEP));
+    }
+    {
+        let bump = bump_autoscroll_speed.clone();
+        faster_btn.connect_clicked(move |_| bump(AUTOSCROLL_PPS_STEP));
     }
     {
         let rs = rs.clone();
@@ -654,6 +714,7 @@ pub fn open_reader(
         let window_keys = window.clone();
         let set_autoscroll = set_autoscroll.clone();
         let autoscroll_on = autoscroll_on.clone();
+        let bump_autoscroll_speed = bump_autoscroll_speed.clone();
         let chrome_visible = chrome_visible.clone();
         let sync_chrome = sync_chrome.clone();
         let controller = EventControllerKey::new();
@@ -667,6 +728,14 @@ pub fn open_reader(
                 Key::Down | Key::j | Key::J | Key::Page_Down => { turn_or_pan(0, 1); glib::Propagation::Stop }
                 Key::Up | Key::k | Key::K | Key::Page_Up | Key::BackSpace => { turn_or_pan(0, -1); glib::Propagation::Stop }
                 Key::space => { set_autoscroll(!autoscroll_on.get()); glib::Propagation::Stop }
+                Key::minus | Key::KP_Subtract => {
+                    if autoscroll_on.get() { bump_autoscroll_speed(-AUTOSCROLL_PPS_STEP); }
+                    glib::Propagation::Stop
+                }
+                Key::equal | Key::plus | Key::KP_Add => {
+                    if autoscroll_on.get() { bump_autoscroll_speed(AUTOSCROLL_PPS_STEP); }
+                    glib::Propagation::Stop
+                }
                 Key::t | Key::T => {
                     chrome_visible.set(!chrome_visible.get());
                     sync_chrome();
