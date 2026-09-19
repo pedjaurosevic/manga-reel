@@ -10,7 +10,6 @@ mod ui;
 
 use gtk4::gio;
 use gtk4::prelude::*;
-use libadwaita::prelude::*;
 use libadwaita::Application;
 use std::env;
 use std::path::PathBuf;
