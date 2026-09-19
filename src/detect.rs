@@ -11,4 +11,6 @@
 //! Why not contour/CC (v5): contours crop figures *inside* framed panels;
 //! gutter BSP only cuts empty bands *between* frames (Italian 2-up grids).
 
-include!("detect_gutter_bsp.inc.rs");
+include!("detect_part1.inc.rs");
+include!("detect_part2.inc.rs");
+include!("detect_part3.inc.rs");
