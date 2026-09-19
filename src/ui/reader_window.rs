@@ -185,7 +185,9 @@ pub fn open_reader(
     let letter_btn = ToggleButton::with_label("Black");
     letter_btn.set_tooltip_text(Some("Letterbox black / white"));
     let auto_btn = ToggleButton::with_label("Auto");
-    auto_btn.set_tooltip_text(Some("Autoscroll (Space) — seamless continuous strip"));
+    auto_btn.set_tooltip_text(Some("Smooth continuous autoscroll (speed ↓/↑)"));
+    let manual_btn = ToggleButton::with_label("Manual");
+    manual_btn.set_tooltip_text(Some("Manual: Space jumps down by 1/3 of the screen"));
     let panel_btn = ToggleButton::with_label("Panel");
     panel_btn.set_tooltip_text(Some("Panel mode — full-height frames; toggle returns to page pan"));
 
@@ -215,6 +217,7 @@ pub fn open_reader(
     header.pack_end(&order_btn);
     header.pack_end(&speed_box);
     header.pack_end(&panel_btn);
+    header.pack_end(&manual_btn);
     header.pack_end(&auto_btn);
     header.pack_end(&fit_drop);
 
@@ -311,6 +314,7 @@ pub fn open_reader(
 
     let animating = Rc::new(Cell::new(false));
     let autoscroll_on = Rc::new(Cell::new(false));
+    let manual_on = Rc::new(Cell::new(false));
     let panel_mode_on = Rc::new(Cell::new(false));
 
     {
@@ -363,6 +367,7 @@ pub fn open_reader(
         let info = info.clone();
         let rs = rs.clone();
         let autoscroll_on = autoscroll_on.clone();
+        let manual_on = manual_on.clone();
         Rc::new(move || {
             let borrow = rs.borrow();
             let Some(st) = borrow.as_ref() else { info.set_text("…"); return; };
@@ -371,7 +376,13 @@ pub fn open_reader(
                 FitMode::Height => "height",
                 FitMode::Contain => "page",
             };
-            let auto = if autoscroll_on.get() { " · AUTO" } else { "" };
+            let auto = if autoscroll_on.get() {
+                " · AUTO"
+            } else if manual_on.get() {
+                " · MANUAL"
+            } else {
+                ""
+            };
             if st.panel_mode {
                 let pc = st.panels.len().max(1);
                 info.set_text(&format!(
@@ -380,7 +391,7 @@ pub fn open_reader(
                 ));
             } else {
                 info.set_text(&format!(
-                    "Page {}/{} · fit {}{} · dbl-click chrome · Space auto",
+                    "Page {}/{} · fit {}{} · Space: Manual ⅓ / Auto",
                     st.page_index + 1, st.archive.page_count(), fit, auto
                 ));
             }
@@ -652,10 +663,16 @@ pub fn open_reader(
         let rs = rs.clone();
         let autoscroll_on = autoscroll_on.clone();
         let auto_btn = auto_btn.clone();
+        let manual_btn = manual_btn.clone();
+        let manual_on = manual_on.clone();
         let redraw = redraw.clone();
         let refresh_neighbors = refresh_neighbors.clone();
         let sync_speed_ui = sync_speed_ui.clone();
         Rc::new(move |on: bool| {
+            if on {
+                manual_on.set(false);
+                if manual_btn.is_active() { manual_btn.set_active(false); }
+            }
             autoscroll_on.set(on);
             if let Some(st) = rs.borrow_mut().as_mut() { st.autoscroll = on; }
             if auto_btn.is_active() != on { auto_btn.set_active(on); }
@@ -665,16 +682,52 @@ pub fn open_reader(
         })
     };
 
+    let set_manual = {
+        let manual_on = manual_on.clone();
+        let manual_btn = manual_btn.clone();
+        let set_autoscroll = set_autoscroll.clone();
+        let redraw = redraw.clone();
+        Rc::new(move |on: bool| {
+            if on {
+                set_autoscroll(false);
+            }
+            manual_on.set(on);
+            if manual_btn.is_active() != on {
+                manual_btn.set_active(on);
+            }
+            redraw();
+        })
+    };
+
+    let step_third = {
+        let try_pan = try_pan.clone();
+        let turn_or_pan = turn_or_pan.clone();
+        let area = area.clone();
+        let pause_autoscroll = pause_autoscroll.clone();
+        Rc::new(move |dir: i32| {
+            // dir > 0 = down, < 0 = up — one third of the viewport.
+            pause_autoscroll();
+            let alloc = area.allocation();
+            let vh = alloc.height().max(1) as f64;
+            let amount = vh / 3.0;
+            if !try_pan(0.0, dir as f64 * amount) {
+                turn_or_pan(0, dir);
+            }
+        })
+    };
+
     let set_panel_mode = {
         let rs = rs.clone();
         let panel_mode_on = panel_mode_on.clone();
         let panel_btn = panel_btn.clone();
         let pause_autoscroll = pause_autoscroll.clone();
+        let set_manual = set_manual.clone();
         let redraw = redraw.clone();
         let area = area.clone();
         Rc::new(move |on: bool| {
             if on {
                 pause_autoscroll();
+                set_manual(false);
             }
             panel_mode_on.set(on);
             if panel_btn.is_active() != on {
@@ -840,6 +893,17 @@ pub fn open_reader(
         });
     }
     {
+        let set_manual = set_manual.clone();
+        let panel_mode_on = panel_mode_on.clone();
+        manual_btn.connect_toggled(move |btn| {
+            if panel_mode_on.get() {
+                btn.set_active(false);
+                return;
+            }
+            set_manual(btn.is_active());
+        });
+    }
+    {
         let set_panel_mode = set_panel_mode.clone();
         panel_btn.connect_toggled(move |btn| set_panel_mode(btn.is_active()));
     }
@@ -951,6 +1015,9 @@ pub fn open_reader(
         let window_keys = window.clone();
         let set_autoscroll = set_autoscroll.clone();
         let autoscroll_on = autoscroll_on.clone();
+        let manual_on = manual_on.clone();
+        let set_manual = set_manual.clone();
+        let step_third = step_third.clone();
         let bump_autoscroll_speed = bump_autoscroll_speed.clone();
         let chrome_visible = chrome_visible.clone();
         let sync_chrome = sync_chrome.clone();
@@ -998,7 +1065,19 @@ pub fn open_reader(
                 Key::Left | Key::a | Key::A | Key::h | Key::H => { turn_or_pan(-1, 0); glib::Propagation::Stop }
                 Key::Down | Key::j | Key::J | Key::Page_Down => { turn_or_pan(0, 1); glib::Propagation::Stop }
                 Key::Up | Key::k | Key::K | Key::Page_Up | Key::BackSpace => { turn_or_pan(0, -1); glib::Propagation::Stop }
-                Key::space => { set_autoscroll(!autoscroll_on.get()); glib::Propagation::Stop }
+                Key::space => {
+                    if manual_on.get() {
+                        let up = mods.contains(ModifierType::SHIFT_MASK);
+                        step_third(if up { -1 } else { 1 });
+                    } else if autoscroll_on.get() {
+                        set_autoscroll(false);
+                    } else {
+                        // Default: enter Manual and jump one third (Space = page through).
+                        set_manual(true);
+                        step_third(1);
+                    }
+                    glib::Propagation::Stop
+                }
                 Key::p | Key::P => { set_panel_mode(true); glib::Propagation::Stop }
                 Key::minus | Key::KP_Subtract => {
                     if autoscroll_on.get() { bump_autoscroll_speed(-AUTOSCROLL_PPS_STEP); }
