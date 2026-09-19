@@ -1,8 +1,10 @@
-# Manga Reel 0.1.1
+# Manga Reel 0.1.2
 
-**Version 0.1.1** — panel detect v7, true-black letterbox, cover library.
+**Version 0.1.2** — non-blocking library (async scan/covers), GVFS-safe folders, SFTP cache + unrar timeouts.
 
 **Manga Reel** is an open-source CBZ/CBR comic reader for Linux (Rust + GTK4 + libadwaita).
+
+**0.1.2 notes:** Library window paints immediately; folder scan and covers run off the GTK thread (cap 400). Offline folders are never wiped. Remote CBR/CBZ copy to local cache before unrar. Detects missing gvfsd-fuse.
 
 **0.1.1 notes:** Panel mode uses pre-bake detection (Italian grids → multiple panels). Letterbox **Black** is pure `#000000`. Library shows cover cards with clean titles. Real Paper is baked into page pixels only (no gray surround parallax).
 

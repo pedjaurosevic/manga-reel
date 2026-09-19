@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2 — 2026-09-19
+
+### Fixes
+- **Library wipe on unmount**: refresh no longer `retain(|f| f.is_dir())` + save. Offline / unmounted folders (My Passport, GVFS) stay in `library.json`; status shows e.g. `N folder(a) offline (My Passport)`.
+- If `folders` is empty but progress has paths, auto-re-add unique parent dirs (no `is_dir` required).
+- **Async library scan**: window paints immediately with “Skeniram biblioteku…”; WalkDir runs off the GTK thread (cap 400 comics, depth 8). Soft-cap note in status when truncated.
+- **Async covers**: grid builds with title + placeholder; cover thumbs load on a worker thread and are cached under `~/.cache/manga-reel/covers/` (path+mtime/size key). Never run `unrar` for dozens of remote CBRs on the GTK thread.
+- **GVFS / SFTP open**: archives under `/run/user/*/gvfs/` are copied to `~/.cache/manga-reel/archives/` before zip/unrar; subsequent opens reuse the cache. Status: `Kopiram sa starog (SFTP)…`.
+- **`unrar` timeouts**: `timeout(1)` wraps list (60s) and page extract (120s) so a stuck SFTP cannot hang forever.
+- **gvfsd-fuse**: if FUSE mount is missing, status warns clearly (Gio SFTP can work while `Path::is_dir` is always false — that was the wipe root cause).
+
 ## 0.1.1 — 2026-09-19
 
 ### Fixes

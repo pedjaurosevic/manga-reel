@@ -12,12 +12,14 @@ use gtk4::{
 };
 use libadwaita::prelude::*;
 use libadwaita::{Application, ApplicationWindow, HeaderBar, ToolbarView, WindowTitle};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 /// Primary comics disk on stari (same place Nautilus shows as My Passport).
 const DEFAULT_LIBRARY_URI: &str = "sftp://po@stari/media/po/My%20Passport";
+
 
 fn file_to_local_path(file: &gio::File) -> Option<PathBuf> {
     if let Some(path) = file.path() {
@@ -346,40 +348,109 @@ impl LibraryWindow {
         toolbar.set_content(Some(&content));
         window.set_content(Some(&toolbar));
 
+
+        // Generation so stale background scans are ignored after a new Refresh.
+        let scan_gen = Rc::new(Cell::new(0u64));
+
         let refresh = {
             let state = state.clone();
             let flow = flow.clone();
             let status = status.clone();
             let app = app.clone();
+            let scan_gen = scan_gen.clone();
             Rc::new(move || {
+                // Paint immediately — clear grid, show scanning, never WalkDir/unrar here.
                 while let Some(child) = flow.first_child() {
                     flow.remove(&child);
                 }
-                // Drop missing folders with a user-visible note.
-                {
-                    let mut st = state.borrow_mut();
-                    let before = st.folders.len();
-                    st.folders.retain(|f| f.is_dir());
-                    if st.folders.len() < before {
-                        let _ = library::save_state(&st);
+                status.set_text("Skeniram biblioteku…");
+                let gen = scan_gen.get().wrapping_add(1);
+                scan_gen.set(gen);
+
+                let state_snap = state.borrow().clone();
+                let state_ui = state.clone();
+                let flow_ui = flow.clone();
+                let status_ui = status.clone();
+                let app_ui = app.clone();
+                let scan_gen_ui = scan_gen.clone();
+
+                glib::spawn_future_local(async move {
+                    let opts = library::ScanOptions::default();
+                    let result = gio::spawn_blocking(move || {
+                        library::scan_snapshot(state_snap, opts)
+                    })
+                    .await;
+                    let Ok((new_state, snap)) = result else {
+                        status_ui.set_text("Skeniranje nije uspelo.");
+                        return;
+                    };
+                    if scan_gen_ui.get() != gen {
+                        return; // superseded
                     }
-                }
-                let entries = library::scan_all(&state.borrow());
-                if entries.is_empty() {
-                    match library_browse_root() {
-                        Ok(_) => status.set_text(
-                            "No comics yet — use My Passport to browse stari like Nautilus.",
-                        ),
-                        Err(msg) => status.set_text(&msg),
+                    if snap.recovered > 0 {
+                        *state_ui.borrow_mut() = new_state;
+                        let _ = library::save_state(&state_ui.borrow());
+                    } else {
+                        state_ui.borrow_mut().folders = new_state.folders;
                     }
-                } else {
-                    status.set_text(&format!("{} comic(s)", entries.len()));
-                    for entry in &entries {
-                        flow.append(&make_cover_card(entry, &app, &state));
+
+                    while let Some(child) = flow_ui.first_child() {
+                        flow_ui.remove(&child);
                     }
-                }
+
+                    let mut bits: Vec<String> = Vec::new();
+                    if snap.fuse == library::GvfsFuseStatus::Missing {
+                        bits.push(
+                            "gvfsd-fuse nije aktivan — pokreni: /usr/lib/gvfsd-fuse /run/user/$(id -u)/gvfs -f"
+                                .into(),
+                        );
+                    }
+                    if !snap.offline.is_empty() {
+                        let mut labels: Vec<String> = snap
+                            .offline
+                            .iter()
+                            .map(|p| library::folder_label(p))
+                            .collect::<HashSet<_>>()
+                            .into_iter()
+                            .collect();
+                        labels.sort();
+                        bits.push(format!(
+                            "{} folder(a) offline ({})",
+                            snap.offline.len(),
+                            labels.join(", ")
+                        ));
+                    }
+                    if snap.entries.is_empty() {
+                        if snap.online.is_empty() && snap.folder_count > 0 {
+                            bits.push(
+                                "Nema dostupnih foldera — montiraj My Passport pa Refresh."
+                                    .into(),
+                            );
+                        } else {
+                            bits.push(
+                                "Nema stripova — My Passport → dodaj folder (npr. !STRIPOVI)."
+                                    .into(),
+                            );
+                        }
+                        status_ui.set_text(&bits.join(" · "));
+                    } else {
+                        let mut head = format!("{} strip(ova)", snap.entries.len());
+                        if snap.truncated {
+                            head.push_str(&format!(
+                                " (prikazano prvih {}; ostalo na Refresh / uži folder)",
+                                library::DEFAULT_SCAN_CAP
+                            ));
+                        }
+                        bits.insert(0, head);
+                        status_ui.set_text(&bits.join(" · "));
+                        for entry in &snap.entries {
+                            flow_ui.append(&make_cover_card(entry, &app_ui, &state_ui));
+                        }
+                    }
+                });
             })
         };
+        // Kick off async scan AFTER widgets exist; window presents immediately.
         refresh();
 
         {
@@ -533,27 +604,30 @@ impl LibraryWindow {
     }
 }
 
-fn cover_pixbuf(path: &std::path::Path) -> Option<Pixbuf> {
+/// Load cover on a worker thread; never call unrar on the GTK main thread.
+/// Ensure a PNG cover thumb exists under cache. Runs off the UI thread.
+/// Returns the cache path when ready (main thread loads Pixbuf from it).
+fn ensure_cover_cache(path: &std::path::Path) -> Option<PathBuf> {
+    let cache = library::cover_cache_path(path);
+    if cache.is_file() && cache.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        return Some(cache);
+    }
     let archive = ComicArchive::open(path).ok()?;
     let bytes = archive.cover_bytes().ok()?;
     let img = image::load_from_memory(&bytes).ok()?.into_rgba8();
     let (w, h) = (img.width(), img.height());
-    // Scale down for card thumb (~180px tall).
     let target_h = 220u32;
     let scale = target_h as f32 / h.max(1) as f32;
     let tw = ((w as f32) * scale).round().max(40.0) as u32;
     let th = target_h;
     let resized = image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle);
-    let rgba = resized.into_raw();
-    Some(Pixbuf::from_bytes(
-        &glib::Bytes::from(&rgba),
-        gtk4::gdk_pixbuf::Colorspace::Rgb,
-        true,
-        8,
-        tw as i32,
-        th as i32,
-        (tw * 4) as i32,
-    ))
+    if let Some(parent) = cache.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    image::DynamicImage::ImageRgba8(resized)
+        .save(&cache)
+        .ok()?;
+    Some(cache)
 }
 
 fn make_cover_card(
@@ -576,22 +650,40 @@ fn make_cover_card(
     v.set_margin_end(10);
     v.set_halign(Align::Center);
 
-    if let Some(pb) = cover_pixbuf(&entry.path) {
-        let picture = Picture::new();
-        picture.set_can_shrink(true);
-        picture.set_content_fit(gtk4::ContentFit::Contain);
-        picture.set_height_request(220);
-        picture.set_width_request(140);
-        picture.set_pixbuf(Some(&pb));
-        v.append(&picture);
-    } else {
-        let placeholder = Label::new(Some("📕"));
-        placeholder.set_margin_top(80);
-        placeholder.set_margin_bottom(80);
-        placeholder.set_height_request(220);
-        placeholder.add_css_class("title-1");
-        v.append(&placeholder);
-    }
+    // Placeholder immediately — covers load async so remote CBR cannot freeze UI.
+    let picture = Picture::new();
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk4::ContentFit::Contain);
+    picture.set_height_request(220);
+    picture.set_width_request(140);
+    let placeholder = Label::new(Some("📕"));
+    placeholder.set_margin_top(80);
+    placeholder.set_margin_bottom(80);
+    placeholder.set_height_request(220);
+    placeholder.add_css_class("title-1");
+    let cover_box = GtkBox::new(Orientation::Vertical, 0);
+    cover_box.set_height_request(220);
+    cover_box.append(&placeholder);
+    cover_box.append(&picture);
+    picture.set_visible(false);
+    v.append(&cover_box);
+
+    let path_for_cover = entry.path.clone();
+    let picture_w = picture.clone();
+    let placeholder_w = placeholder.clone();
+    glib::spawn_future_local(async move {
+        let cached = gio::spawn_blocking(move || ensure_cover_cache(&path_for_cover))
+            .await
+            .ok()
+            .flatten();
+        if let Some(cache_path) = cached {
+            if let Ok(pb) = Pixbuf::from_file(&cache_path) {
+                picture_w.set_pixbuf(Some(&pb));
+                picture_w.set_visible(true);
+                placeholder_w.set_visible(false);
+            }
+        }
+    });
 
     let title = Label::new(Some(&entry.title));
     title.set_halign(Align::Center);
@@ -626,6 +718,60 @@ fn open_comic(
     path: PathBuf,
     status: Option<&Label>,
 ) {
+    if crate::archive::is_remote_or_gvfs(&path) {
+        if let Some(s) = status {
+            s.set_text("Kopiram sa starog (SFTP)…");
+        }
+        let app = app.clone();
+        let state = state.clone();
+        let status_opt = status.cloned();
+        let path_bg = path.clone();
+        glib::spawn_future_local(async move {
+            let key = library::key_for(&path_bg);
+            let result = gio::spawn_blocking(move || ComicArchive::open_with_status(&path_bg, |_| {}))
+                .await;
+            match result {
+                Ok(Ok(archive)) => {
+                    let progress = state.borrow().progress.get(&key).cloned();
+                    if let Some(s) = &status_opt {
+                        s.set_text("Otvoreno.");
+                    }
+                    reader_window::open_reader(&app, archive, state.clone(), progress);
+                }
+                Ok(Err(err)) => {
+                    let msg = format!("Ne mogu da otvorim: {err:#}");
+                    if let Some(s) = &status_opt {
+                        s.set_text(&msg);
+                    }
+                    eprintln!("manga-reel: open failed: {err:#}");
+                    let toast_win = ApplicationWindow::builder()
+                        .application(&app)
+                        .title("Manga Reel")
+                        .default_width(420)
+                        .default_height(160)
+                        .build();
+                    let label = Label::new(Some(&msg));
+                    label.set_wrap(true);
+                    label.set_margin_top(24);
+                    label.set_margin_bottom(24);
+                    label.set_margin_start(24);
+                    label.set_margin_end(24);
+                    toast_win.set_content(Some(&label));
+                    toast_win.present();
+                }
+                Err(_) => {
+                    if let Some(s) = &status_opt {
+                        s.set_text("Otvaranje prekinuto.");
+                    }
+                }
+            }
+        });
+        return;
+    }
+
+    if let Some(s) = status {
+        s.set_text("Otvaram…");
+    }
     match ComicArchive::open(&path) {
         Ok(archive) => {
             let progress = state
@@ -636,7 +782,7 @@ fn open_comic(
             reader_window::open_reader(app, archive, state.clone(), progress);
         }
         Err(err) => {
-            let msg = format!("Could not open comic: {err:#}");
+            let msg = format!("Ne mogu da otvorim: {err:#}");
             if let Some(s) = status {
                 s.set_text(&msg);
             }
