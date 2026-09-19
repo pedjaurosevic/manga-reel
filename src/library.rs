@@ -25,6 +25,7 @@ pub struct ComicProgress {
 pub struct ComicEntry {
     pub path: PathBuf,
     pub title: String,
+    #[allow(dead_code)]
     pub progress: Option<ComicProgress>,
 }
 
@@ -54,6 +55,29 @@ pub fn save_state(state: &LibraryState) -> Result<()> {
     let text = serde_json::to_string_pretty(state)?;
     fs::write(path, text)?;
     Ok(())
+}
+
+
+/// Clean display title from filename/folder stem (strip path junk, leading issue numbers).
+pub fn clean_comic_title(stem: &str) -> String {
+    let mut s = stem.trim().to_string();
+    // Drop common archive suffixes already removed by file_stem; normalize underscores.
+    s = s.replace('_', " ");
+    // Strip leading "284-" / "284 - " / "284." style catalog numbers.
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i < bytes.len() {
+        let rest = s[i..].trim_start_matches(['-', '.', ' ', '_']);
+        if !rest.is_empty() && rest.len() + 2 < s.len() {
+            s = rest.to_string();
+        }
+    }
+    // Collapse whitespace
+    let parts: Vec<_> = s.split_whitespace().collect();
+    parts.join(" ")
 }
 
 pub fn key_for(path: &Path) -> String {
@@ -114,7 +138,7 @@ pub fn scan_all(state: &LibraryState) -> Vec<ComicEntry> {
                 }
                 let title = path
                     .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
+                    .map(|s| clean_comic_title(&s.to_string_lossy()))
                     .unwrap_or_else(|| path.display().to_string());
                 let progress = state.progress.get(&key).cloned();
                 entries.push(ComicEntry {
