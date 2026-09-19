@@ -1,7 +1,7 @@
 //! Page image loading and panel cache structures.
 
 use crate::archive::ComicArchive;
-use crate::detect::{self, PanelRect};
+use crate::detect::{self, PanelRect, DETECT_VERSION};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,7 +76,7 @@ pub fn load_panel_cache(comic: &Path) -> Option<PanelCacheFile> {
     for candidate in [sidecar_path(comic), cache_dir_path(comic, &hash)] {
         if let Ok(text) = fs::read_to_string(&candidate) {
             if let Ok(cache) = serde_json::from_str::<PanelCacheFile>(&text) {
-                if cache.archive_hash == hash && cache.version == 2 {
+                if cache.archive_hash == hash && cache.version == DETECT_VERSION {
                     return Some(cache);
                 }
             }
@@ -122,7 +122,7 @@ pub fn ensure_panels(archive: &ComicArchive) -> Result<PanelCacheFile> {
         });
     }
     let cache = PanelCacheFile {
-        version: 2,
+        version: DETECT_VERSION,
         archive_hash: hash,
         pages,
     };
