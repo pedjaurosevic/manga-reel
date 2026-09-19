@@ -1,6 +1,6 @@
 [package]
 name = "manga-reel"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Manga Reel — panel-by-panel CBZ/CBR comic reader"
 license = "MIT"
@@ -36,4 +36,3 @@ rayon = "1"
 lto = true
 codegen-units = 1
 strip = true
-
