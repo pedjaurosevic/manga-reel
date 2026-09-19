@@ -154,8 +154,8 @@ mod tests {
     }
 
     #[test]
-    fn version_is_six() {
-        assert_eq!(DETECT_VERSION, 6);
+    fn version_is_seven() {
+        assert_eq!(DETECT_VERSION, 7);
     }
 
     #[test]
@@ -203,6 +203,41 @@ mod tests {
         assert!(
             panels.len() >= 3 && panels.len() <= 6,
             "expected ~4 panels, got {} {:?}",
+            panels.len(),
+            panels
+        );
+    }
+
+    #[test]
+    fn cream_paper_two_by_two_grid() {
+        // Cream/yellow paper (Italian scan) with four dark content blocks.
+        let w = 400usize;
+        let h = 400usize;
+        let cream = [240u8, 228, 200, 255];
+        let mut rgba = vec![0u8; w * h * 4];
+        for i in (0..rgba.len()).step_by(4) {
+            rgba[i..i + 4].copy_from_slice(&cream);
+        }
+        let paint = |rgba: &mut [u8], x0: usize, y0: usize, x1: usize, y1: usize| {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = (y * w + x) * 4;
+                    let v = 90 + ((x + y) % 25) as u8;
+                    rgba[i] = v;
+                    rgba[i + 1] = v.saturating_sub(5);
+                    rgba[i + 2] = v.saturating_sub(10);
+                    rgba[i + 3] = 255;
+                }
+            }
+        };
+        paint(&mut rgba, 12, 12, 188, 188);
+        paint(&mut rgba, 212, 12, 388, 188);
+        paint(&mut rgba, 12, 212, 188, 388);
+        paint(&mut rgba, 212, 212, 388, 388);
+        let panels = detect_panels(&rgba, w as u32, h as u32);
+        assert!(
+            panels.len() >= 3 && panels.len() <= 6,
+            "cream paper expected ~4 panels, got {} {:?}",
             panels.len(),
             panels
         );
