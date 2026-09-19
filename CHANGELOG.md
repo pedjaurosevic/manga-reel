@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.4 — 2026-09-19
 
 - Add selection mode and comic deletion in the library: mark individual or multiple comics with checkmark badges, toggle Select All, and delete selected comics with a confirmation dialog.
 - Automatically clean up library state, reading progress, cached cover thumbnails, and local managed archive files from disk upon deletion.
