@@ -55,46 +55,13 @@ fn page_layout(fit: FitMode, pw: f64, ph: f64, vw: f64, vh: f64) -> (f64, f64, f
 }
 
 fn load_image(archive: &ComicArchive, index: usize) -> Option<PageImage> {
-    archive.load_page_rgba(index).ok().map(|(w, h, rgba)| PageImage { w, h, rgba })
+    archive.load_page_rgba(index).ok().map(|(w, h, mut rgba)| {
+        // Bake Real Paper 2 into the page so paper and ink scroll as one sheet.
+        crate::paper::apply_real_paper_2(&mut rgba, w, h);
+        PageImage { w, h, rgba }
+    })
 }
 
-
-/// Paper grain locked to page coordinates (scrolls with pan) so Real Paper–like
-/// tooth does not sit still while the comic slides — closer to ink on a real sheet.
-fn paint_paper_grain(cr: &gtk4::cairo::Context, vw: f64, vh: f64, pan_x: f64, pan_y: f64) {
-    cr.save().ok();
-    // Soft multiply-ish overlay: darken peaks slightly in content space.
-    cr.set_operator(gtk4::cairo::Operator::Overlay);
-    cr.set_source_rgba(0.55, 0.52, 0.48, 0.045);
-    // Tile a stable hash pattern in world space offset by pan.
-    let cell = 3.0_f64;
-    let x0 = (-pan_x).rem_euclid(cell) - cell;
-    let y0 = (-pan_y).rem_euclid(cell) - cell;
-    let mut y = y0;
-    while y < vh + cell {
-        let mut x = x0;
-        while x < vw + cell {
-            // Deterministic speckles from integer cell coords in content space.
-            let cx = ((x + pan_x) / cell).floor() as i64;
-            let cy = ((y + pan_y) / cell).floor() as i64;
-            let mut h = (cx as u32)
-                .wrapping_mul(374761393)
-                .wrapping_add((cy as u32).wrapping_mul(668265263))
-                .wrapping_add(0x9e3779b9u32);
-            h ^= h >> 13;
-            let n = h as f64 / u32::MAX as f64;
-            if n > 0.72 {
-                let a = 0.02 + (n - 0.72) * 0.08;
-                cr.set_source_rgba(0.12, 0.11, 0.09, a);
-                cr.rectangle(x, y, 1.2, 1.2);
-                cr.fill().ok();
-            }
-            x += cell;
-        }
-        y += cell;
-    }
-    cr.restore().ok();
-}
 
 fn paint_page(cr: &gtk4::cairo::Context, img: &PageImage, scale: f64, ox: f64, oy: f64) {
     if let Some(pixbuf) = rgba_to_pixbuf(&img.rgba, img.w, img.h) {
@@ -209,6 +176,9 @@ pub fn open_reader(
         .default_width(1100)
         .default_height(800)
         .build();
+
+    // Hyprland screen shaders fight page-locked paper; disable while reading.
+    let saved_shader = Rc::new(RefCell::new(crate::paper::suspend_hyprland_shader()));
 
     let header = HeaderBar::new();
     header.set_title_widget(Some(&WindowTitle::new("Manga Reel", &title)));
@@ -373,10 +343,6 @@ pub fn open_reader(
             if st.panel_mode {
                 if let Some(panel) = st.panels.get(st.panel_index) {
                     paint_panel_full_height(cr, &st.current, panel, vw, vh);
-                    // Lock grain to panel identity (page+index), not screen pixels.
-                    let lock_x = st.page_index as f64 * 97.0 + panel.x * 400.0;
-                    let lock_y = st.panel_index as f64 * 131.0 + panel.y * 400.0;
-                    paint_paper_grain(cr, vw, vh, lock_x, lock_y);
                 } else {
                     cr.set_source_rgb(0.0, 0.0, 0.0);
                     cr.paint().ok();
@@ -402,8 +368,6 @@ pub fn open_reader(
                 let pox = if pdw <= vw { (vw - pdw) / 2.0 } else { -pan_x.clamp(0.0, (pdw - vw).max(0.0)) };
                 paint_page(cr, prev, pscale, pox, oy - pdh);
             }
-            // Grain moves with pan so paper + page feel like one sheet under Manual/Auto scroll.
-            paint_paper_grain(cr, vw, vh, pan_x, st.pan_y);
         });
     }
 
@@ -1177,10 +1141,22 @@ pub fn open_reader(
         area.add_controller(scroll);
     }
 
-    window.connect_close_request(clone!(@strong save_progress => move |_| {
+    window.connect_close_request(clone!(@strong save_progress, @strong saved_shader => move |_| {
         save_progress();
+        let prev = saved_shader.borrow_mut().take();
+        crate::paper::restore_hyprland_shader(prev.as_deref());
         glib::Propagation::Proceed
     }));
+
+    {
+        let saved_shader = saved_shader.clone();
+        window.connect_destroy(move |_| {
+            let prev = saved_shader.borrow_mut().take();
+            if prev.is_some() {
+                crate::paper::restore_hyprland_shader(prev.as_deref());
+            }
+        });
+    }
 
     refresh_neighbors();
     update_info();

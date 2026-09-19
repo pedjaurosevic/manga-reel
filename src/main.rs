@@ -4,6 +4,7 @@ mod archive;
 mod detect;
 mod library;
 mod page;
+mod paper;
 mod settings;
 mod ui;
 
