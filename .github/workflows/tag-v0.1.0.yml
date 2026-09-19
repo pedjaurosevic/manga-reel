@@ -1,0 +1,36 @@
+name: Tag v0.1.0 release
+on:
+  workflow_dispatch:
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+      - name: Create annotated tag and release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          echo "HEAD=$SHA"
+          if git rev-parse "v0.1.0" >/dev/null 2>&1; then
+            echo "Tag v0.1.0 already exists"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "v0.1.0" "$SHA" -m "Manga Reel 0.1.0"
+            git push origin "v0.1.0"
+          fi
+          if gh release view "v0.1.0" >/dev/null 2>&1; then
+            echo "Release already exists"
+          else
+            gh release create "v0.1.0" \
+              --title "Manga Reel 0.1.0" \
+              --notes-file CHANGELOG.md \
+              --target "$SHA"
+          fi
