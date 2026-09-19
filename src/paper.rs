@@ -18,8 +18,9 @@ pub fn apply_real_paper_2(rgba: &mut [u8], width: u32, height: u32) {
     let luma_w = (0.2126_f32, 0.7152_f32, 0.0722_f32);
     let fdir = normalize2(0.906, 0.422);
     let pdir = normalize2(-0.422, 0.906);
-    let dark_paper = (0.028_f32, 0.026, 0.022);
-    let cream_ink = (0.905_f32, 0.872, 0.805);
+    // Lighter, warmer stock for comics (was near-black rag; user asked brighter + yellower).
+    let dark_paper = (0.118_f32, 0.102, 0.072);
+    let cream_ink = (0.96_f32, 0.92, 0.82);
     let light_dir = normalize2(-0.6, -0.8);
 
     let mut out = vec![0u8; src.len()];
@@ -84,7 +85,7 @@ pub fn apply_real_paper_2(rgba: &mut [u8], width: u32, height: u32) {
             );
 
             let press = (0.5 - hgt).max(0.0) * 0.10 * print_mask;
-            let holdout = hgt * 0.11 * print_mask;
+            let holdout = hgt * 0.07 * print_mask;
             let printed = (
                 mixf(matte.0 * (1.0 - press), dark_paper.0, holdout),
                 mixf(matte.1 * (1.0 - press), dark_paper.1, holdout),
@@ -103,7 +104,7 @@ pub fn apply_real_paper_2(rgba: &mut [u8], width: u32, height: u32) {
                 dark_paper.1 * diffuse,
                 dark_paper.2 * diffuse,
             );
-            let floor_mix = field_mask * 0.55 * (1.0 - smoothstep(0.0, 0.18, lum));
+            let floor_mix = field_mask * 0.32 * (1.0 - smoothstep(0.0, 0.22, lum));
             let base = (
                 mixf(printed.0, printed.0 + stock.0, floor_mix),
                 mixf(printed.1, printed.1 + stock.1, floor_mix),
@@ -117,9 +118,15 @@ pub fn apply_real_paper_2(rgba: &mut [u8], width: u32, height: u32) {
             let vig = (u * v * (1.0 - u) * (1.0 - v)).max(0.0001);
             let vignette = (16.0 * vig).powf(0.035).clamp(0.0, 1.0);
 
-            row[i] = ((textured.0 * vignette).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            row[i + 1] = ((textured.1 * vignette).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            row[i + 2] = ((textured.2 * vignette).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            // Warm paper cast: lift + slight yellow without crushing blacks in ink.
+            let warm = (
+                (textured.0 * 1.08 + 0.04).min(1.0),
+                (textured.1 * 1.05 + 0.03).min(1.0),
+                (textured.2 * 0.96 + 0.01).min(1.0),
+            );
+            row[i] = ((warm.0 * vignette).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            row[i + 1] = ((warm.1 * vignette).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            row[i + 2] = ((warm.2 * vignette).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             row[i + 3] = a0;
         }
     });
