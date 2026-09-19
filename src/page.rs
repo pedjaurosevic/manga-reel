@@ -24,6 +24,7 @@ pub struct PagePanels {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LoadedPage {
     pub index: usize,
     pub width: u32,
@@ -71,6 +72,7 @@ pub fn cache_dir_path(comic: &Path, hash: &str) -> PathBuf {
     base.join(format!("{name}-{hash}.json"))
 }
 
+#[allow(dead_code)]
 pub fn load_panel_cache(comic: &Path) -> Option<PanelCacheFile> {
     let hash = archive_content_hash(comic).ok()?;
     for candidate in [sidecar_path(comic), cache_dir_path(comic, &hash)] {
@@ -85,6 +87,7 @@ pub fn load_panel_cache(comic: &Path) -> Option<PanelCacheFile> {
     None
 }
 
+#[allow(dead_code)]
 pub fn save_panel_cache(comic: &Path, cache: &PanelCacheFile, prefer_sidecar: bool) -> Result<()> {
     let text = serde_json::to_string_pretty(cache)?;
     if prefer_sidecar {
@@ -103,6 +106,7 @@ pub fn save_panel_cache(comic: &Path, cache: &PanelCacheFile, prefer_sidecar: bo
 }
 
 /// Detect panels for all pages (or reuse cache). Runs synchronously — call from a worker thread.
+#[allow(dead_code)]
 pub fn ensure_panels(archive: &ComicArchive) -> Result<PanelCacheFile> {
     if let Some(cache) = load_panel_cache(&archive.path) {
         if cache.pages.len() == archive.page_count() {
@@ -130,6 +134,7 @@ pub fn ensure_panels(archive: &ComicArchive) -> Result<PanelCacheFile> {
     Ok(cache)
 }
 
+#[allow(dead_code)]
 pub fn panels_for_page(cache: &PanelCacheFile, page: usize) -> Vec<PanelRect> {
     cache
         .pages

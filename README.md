@@ -1,4 +1,6 @@
-# Manga Reel
+# Manga Reel 0.1.0
+
+**Version 0.1.0** — first tagged release.
 
 **Manga Reel** is an open-source CBZ/CBR comic reader for Linux (Rust + GTK4 + libadwaita).
 
@@ -15,6 +17,7 @@ Fullscreen page reading with smooth pan, bottom chrome, and seamless autoscroll.
 - Library folder scan; progress in `~/.local/share/manga-reel/`
 - `.desktop` launcher + MIME defaults for CBZ/CBR
 - My Passport / GVFS browse in the library
+- **Real Paper 2** baked once per page load (paper + ink scroll as one sheet)
 
 ## Build
 
