@@ -23,25 +23,6 @@ pub struct PagePanels {
     pub panels: Vec<PanelRect>,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct LoadedPage {
-    pub index: usize,
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-    pub panels: Vec<PanelRect>,
-}
-
-impl ComicArchive {
-    pub fn load_page_rgba(&self, index: usize) -> Result<(u32, u32, Vec<u8>)> {
-        let bytes = self.read_page(index)?;
-        let img = image::load_from_memory(&bytes).context("decode page")?;
-        let rgba = img.to_rgba8();
-        Ok((rgba.width(), rgba.height(), rgba.into_raw()))
-    }
-}
-
 pub fn archive_content_hash(path: &Path) -> Result<String> {
     let meta = fs::metadata(path)?;
     let mut hasher = Sha256::new();
@@ -66,13 +47,12 @@ pub fn cache_dir_path(comic: &Path, hash: &str) -> PathBuf {
         .map(|d| d.cache_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from(".").join(".cache").join("manga-reel"));
     let name = comic
-        .file_name()
+        .file_stem()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "comic".into());
-    base.join(format!("{name}-{hash}.json"))
+    base.join(format!("{name}-{hash}.panels.json"))
 }
 
-#[allow(dead_code)]
 pub fn load_panel_cache(comic: &Path) -> Option<PanelCacheFile> {
     let hash = archive_content_hash(comic).ok()?;
     for candidate in [sidecar_path(comic), cache_dir_path(comic, &hash)] {
@@ -87,7 +67,6 @@ pub fn load_panel_cache(comic: &Path) -> Option<PanelCacheFile> {
     None
 }
 
-#[allow(dead_code)]
 pub fn save_panel_cache(comic: &Path, cache: &PanelCacheFile, prefer_sidecar: bool) -> Result<()> {
     let text = serde_json::to_string_pretty(cache)?;
     if prefer_sidecar {
@@ -105,41 +84,57 @@ pub fn save_panel_cache(comic: &Path, cache: &PanelCacheFile, prefer_sidecar: bo
     Ok(())
 }
 
-/// Detect panels for all pages (or reuse cache). Runs synchronously — call from a worker thread.
-#[allow(dead_code)]
-pub fn ensure_panels(archive: &ComicArchive) -> Result<PanelCacheFile> {
+/// Detect panels for one page (raw pixels). Merges into on-disk cache when possible.
+pub fn detect_page_panels(archive: &ComicArchive, page: usize) -> Result<Vec<PanelRect>> {
+    let hash = archive_content_hash(&archive.path)?;
     if let Some(cache) = load_panel_cache(&archive.path) {
-        if cache.pages.len() == archive.page_count() {
-            return Ok(cache);
+        if let Some(p) = cache.pages.iter().find(|p| p.page_index == page) {
+            return Ok(p.panels.clone());
         }
     }
-    let hash = archive_content_hash(&archive.path)?;
-    let mut pages = Vec::with_capacity(archive.page_count());
-    for i in 0..archive.page_count() {
-        let (w, h, rgba) = archive.load_page_rgba(i)?;
-        let panels = detect::detect_panels(&rgba, w, h);
-        pages.push(PagePanels {
-            page_index: i,
-            width: w,
-            height: h,
-            panels,
-        });
-    }
-    let cache = PanelCacheFile {
-        version: DETECT_VERSION,
-        archive_hash: hash,
-        pages,
+    let (w, h, rgba) = archive.load_page_rgba(page)?;
+    let panels = detect::detect_panels(&rgba, w, h);
+    let entry = PagePanels {
+        page_index: page,
+        width: w,
+        height: h,
+        panels: panels.clone(),
     };
+    let mut cache = load_panel_cache(&archive.path).unwrap_or(PanelCacheFile {
+        version: DETECT_VERSION,
+        archive_hash: hash.clone(),
+        pages: Vec::new(),
+    });
+    if cache.archive_hash != hash || cache.version != DETECT_VERSION {
+        cache = PanelCacheFile {
+            version: DETECT_VERSION,
+            archive_hash: hash,
+            pages: Vec::new(),
+        };
+    }
+    cache.pages.retain(|p| p.page_index != page);
+    cache.pages.push(entry);
+    cache.pages.sort_by_key(|p| p.page_index);
     let _ = save_panel_cache(&archive.path, &cache, true);
-    Ok(cache)
+    Ok(panels)
 }
 
-#[allow(dead_code)]
-pub fn panels_for_page(cache: &PanelCacheFile, page: usize) -> Vec<PanelRect> {
-    cache
-        .pages
-        .iter()
-        .find(|p| p.page_index == page)
-        .map(|p| p.panels.clone())
-        .unwrap_or_default()
+/// Warm in-memory map from disk cache (DETECT_VERSION gated).
+pub fn load_panels_map(comic: &Path) -> std::collections::HashMap<usize, Vec<PanelRect>> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(cache) = load_panel_cache(comic) {
+        for p in cache.pages {
+            map.insert(p.page_index, p.panels);
+        }
+    }
+    map
+}
+
+impl ComicArchive {
+    pub fn load_page_rgba(&self, index: usize) -> Result<(u32, u32, Vec<u8>)> {
+        let bytes = self.read_page(index)?;
+        let img = image::load_from_memory(&bytes).context("decode page")?;
+        let rgba = img.to_rgba8();
+        Ok((rgba.width(), rgba.height(), rgba.into_raw()))
+    }
 }
