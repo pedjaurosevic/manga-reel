@@ -15,24 +15,236 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-/// Primary comics disk on stari — folder picker starts here.
-const DEFAULT_LIBRARY_ROOT: &str = "sftp://po@stari/media/po/My%20Passport";
-
-fn library_browse_root() -> gio::File {
-    gio::File::for_uri(DEFAULT_LIBRARY_ROOT)
-}
+/// Primary comics disk on stari (same place Nautilus shows as My Passport).
+const DEFAULT_LIBRARY_URI: &str = "sftp://po@stari/media/po/My%20Passport";
 
 fn file_to_local_path(file: &gio::File) -> Option<PathBuf> {
     if let Some(path) = file.path() {
         return Some(path);
     }
-    // GVFS sometimes needs a query before path() fills in.
     let _ = file.query_info(
         "standard::name",
         gio::FileQueryInfoFlags::NONE,
         None::<&gio::Cancellable>,
     );
     file.path()
+}
+
+/// Resolve My Passport to a local GVFS path the portal file dialog can open.
+/// Portal choosers often ignore sftp:// initial folders and hide network bookmarks.
+fn library_browse_root() -> gio::File {
+    let remote = gio::File::for_uri(DEFAULT_LIBRARY_URI);
+    // Touch the URI so gvfs mounts it (like opening in Nautilus).
+    let _ = remote.query_info(
+        "standard::name,standard::type",
+        gio::FileQueryInfoFlags::NONE,
+        None::<&gio::Cancellable>,
+    );
+    if let Some(path) = remote.path() {
+        if path.is_dir() {
+            return gio::File::for_path(path);
+        }
+    }
+    // Common fuse layouts if path() is empty briefly after mount.
+    if let Ok(uid) = std::env::var("UID") {
+        let candidates = [
+            format!("/run/user/{uid}/gvfs/sftp:host=stari,user=po/media/po/My Passport"),
+            format!("/run/user/{uid}/gvfs/sftp:host=stari,user=po/mnt/passport"),
+        ];
+        for c in candidates {
+            let pb = PathBuf::from(&c);
+            if pb.is_dir() {
+                return gio::File::for_path(pb);
+            }
+        }
+    }
+    if let Ok(uid) = std::process::Command::new("id").arg("-u").output() {
+        let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
+        for suffix in [
+            "gvfs/sftp:host=stari,user=po/media/po/My Passport",
+            "gvfs/sftp:host=stari,user=po/mnt/passport",
+        ] {
+            let pb = PathBuf::from(format!("/run/user/{uid}/{suffix}"));
+            if pb.is_dir() {
+                return gio::File::for_path(pb);
+            }
+        }
+    }
+    remote
+}
+
+
+fn list_subdirs(dir: &gio::File) -> Vec<(String, gio::File)> {
+    let mut out = Vec::new();
+    let Ok(enumerator) = dir.enumerate_children(
+        "standard::name,standard::type,standard::display-name",
+        gio::FileQueryInfoFlags::NONE,
+        None::<&gio::Cancellable>,
+    ) else {
+        return out;
+    };
+    while let Some(info) = enumerator.next_file(None::<&gio::Cancellable>).ok().flatten() {
+        if info.file_type() != gio::FileType::Directory {
+            continue;
+        }
+        let name = info.display_name().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let child = dir.child(info.name());
+        out.push((name, child));
+    }
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out
+}
+
+/// In-app folder browser for My Passport — portal dialogs often omit network mounts.
+fn open_passport_browser(
+    parent: &ApplicationWindow,
+    state: Rc<RefCell<LibraryState>>,
+    refresh: Rc<dyn Fn()>,
+) {
+    let root = library_browse_root();
+    let browser = ApplicationWindow::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("My Passport")
+        .default_width(560)
+        .default_height(640)
+        .build();
+
+    let header = HeaderBar::new();
+    header.set_title_widget(Some(&WindowTitle::new("My Passport", "stari")));
+    let up_btn = Button::from_icon_name("go-up-symbolic");
+    up_btn.set_tooltip_text(Some("Parent folder"));
+    let add_here_btn = Button::with_label("Add this folder");
+    add_here_btn.add_css_class("suggested-action");
+    header.pack_start(&up_btn);
+    header.pack_end(&add_here_btn);
+
+    let path_label = Label::new(Some(&root.parse_name()));
+    path_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+    path_label.set_halign(Align::Start);
+    path_label.set_margin_start(12);
+    path_label.set_margin_end(12);
+    path_label.set_margin_top(8);
+    path_label.add_css_class("dim-label");
+
+    let list = ListBox::new();
+    list.set_selection_mode(SelectionMode::Single);
+    list.add_css_class("boxed-list");
+    list.set_margin_top(8);
+    list.set_margin_bottom(12);
+    list.set_margin_start(12);
+    list.set_margin_end(12);
+
+    let scrolled = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .vexpand(true)
+        .child(&list)
+        .build();
+
+    let hint = Label::new(Some("Double-click a folder to open it. Add this folder to library when ready."));
+    hint.add_css_class("dim-label");
+    hint.set_margin_bottom(10);
+    hint.set_halign(Align::Center);
+
+    let body = GtkBox::new(Orientation::Vertical, 0);
+    body.append(&path_label);
+    body.append(&scrolled);
+    body.append(&hint);
+
+    let toolbar = ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&body));
+    browser.set_content(Some(&toolbar));
+
+    let current = Rc::new(RefCell::new(root));
+
+    let reload = {
+        let list = list.clone();
+        let path_label = path_label.clone();
+        let current = current.clone();
+        Rc::new(move || {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            let dir = current.borrow().clone();
+            path_label.set_text(&dir.parse_name());
+            for (name, child) in list_subdirs(&dir) {
+                let row = ListBoxRow::new();
+                row.set_widget_name(&child.uri());
+                let label = Label::new(Some(&name));
+                label.set_halign(Align::Start);
+                label.set_margin_top(10);
+                label.set_margin_bottom(10);
+                label.set_margin_start(10);
+                label.set_margin_end(10);
+                row.set_child(Some(&label));
+                list.append(&row);
+            }
+        })
+    };
+    reload();
+
+    {
+        let current = current.clone();
+        let reload = reload.clone();
+        let root_uri = library_browse_root().uri().to_string();
+        up_btn.connect_clicked(move |_| {
+            let cur = current.borrow().clone();
+            if cur.uri().as_str() == root_uri {
+                return;
+            }
+            if let Some(parent) = cur.parent() {
+                // Do not leave My Passport root.
+                let root = gio::File::for_uri(&root_uri);
+                if parent.equal(&root) || parent.uri().starts_with(root.uri().as_str()) || parent.path().and_then(|p| {
+                    root.path().map(|r| p.starts_with(r))
+                }).unwrap_or(false) {
+                    *current.borrow_mut() = parent;
+                    reload();
+                } else {
+                    *current.borrow_mut() = root;
+                    reload();
+                }
+            }
+        });
+    }
+
+    {
+        let current = current.clone();
+        let reload = reload.clone();
+        list.connect_row_activated(move |_, row| {
+            let uri = row.widget_name();
+            if uri.is_empty() {
+                return;
+            }
+            *current.borrow_mut() = gio::File::for_uri(uri.as_str());
+            reload();
+        });
+    }
+
+    {
+        let current = current.clone();
+        let state = state.clone();
+        let refresh = refresh.clone();
+        let browser = browser.clone();
+        add_here_btn.connect_clicked(move |_| {
+            let file = current.borrow().clone();
+            if let Some(path) = file_to_local_path(&file) {
+                library::add_folder(&mut state.borrow_mut(), path);
+                let _ = library::save_state(&state.borrow());
+                refresh();
+                browser.close();
+            } else {
+                eprintln!("manga-reel: cannot resolve {}", file.uri());
+            }
+        });
+    }
+
+    browser.present();
 }
 
 pub struct LibraryWindow {
@@ -57,11 +269,14 @@ impl LibraryWindow {
         let open_btn = Button::from_icon_name("document-open-symbolic");
         open_btn.set_tooltip_text(Some("Open CBZ/CBR"));
         let add_folder_btn = Button::from_icon_name("folder-new-symbolic");
-        add_folder_btn.set_tooltip_text(Some("Add library folder (starts on stari My Passport)"));
+        add_folder_btn.set_tooltip_text(Some("Add library folder (starts inside My Passport)"));
+        let passport_btn = Button::with_label("My Passport");
+        passport_btn.set_tooltip_text(Some("Browse My Passport on stari (same as Nautilus)"));
         let refresh_btn = Button::from_icon_name("view-refresh-symbolic");
         refresh_btn.set_tooltip_text(Some("Refresh library"));
         header.pack_start(&open_btn);
         header.pack_start(&add_folder_btn);
+        header.pack_start(&passport_btn);
         header.pack_end(&refresh_btn);
 
         let list = ListBox::new();
@@ -103,7 +318,7 @@ impl LibraryWindow {
                 }
                 let entries = library::scan_all(&state.borrow());
                 if entries.is_empty() {
-                    status.set_text("No comics yet — Add folder starts on stari My Passport.");
+                    status.set_text("No comics yet — use My Passport to browse stari like Nautilus.");
                 } else {
                     status.set_text(&format!("{} comic(s) in library", entries.len()));
                     for entry in &entries {
@@ -123,14 +338,29 @@ impl LibraryWindow {
             });
         }
 
+        let open_library_folder_dialog = {
+            let window = window.clone();
+            Rc::new(move |title: &str| {
+                let root = library_browse_root();
+                eprintln!(
+                    "manga-reel: library browse root uri={} path={:?}",
+                    root.uri(),
+                    root.path()
+                );
+                let dialog = FileDialog::new();
+                dialog.set_title(title);
+                dialog.set_initial_folder(Some(&root));
+                dialog
+            })
+        };
+
         {
             let window = window.clone();
             let state = state.clone();
             let refresh = refresh.clone();
+            let open_library_folder_dialog = open_library_folder_dialog.clone();
             add_folder_btn.connect_clicked(move |_| {
-                let dialog = FileDialog::new();
-                dialog.set_title("Select library folder");
-                dialog.set_initial_folder(Some(&library_browse_root()));
+                let dialog = open_library_folder_dialog("Select library folder");
                 let state = state.clone();
                 let refresh = refresh.clone();
                 dialog.select_folder(
@@ -151,6 +381,19 @@ impl LibraryWindow {
                         }
                     },
                 );
+            });
+        }
+
+        {
+            let window = window.clone();
+            let state = state.clone();
+            let refresh = refresh.clone();
+            passport_btn.connect_clicked(move |_| {
+                let refresh_dyn: Rc<dyn Fn()> = Rc::new({
+                    let refresh = refresh.clone();
+                    move || refresh()
+                });
+                open_passport_browser(&window, state.clone(), refresh_dyn);
             });
         }
 
