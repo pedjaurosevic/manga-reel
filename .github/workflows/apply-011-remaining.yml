@@ -1,9 +1,6 @@
 name: Apply 0.1.1 remaining upload
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '.agent-upload/011-remaining.*.b64'
 jobs:
   apply:
     runs-on: ubuntu-latest
@@ -14,12 +11,17 @@ jobs:
       - name: Unpack and commit remaining 0.1.1 files
         run: |
           set -euo pipefail
-          cat .agent-upload/011-remaining.*.b64 | base64 -d > /tmp/rem.tar.gz
+          test -d .agent-upload
+          cat .agent-upload/011-remaining.*.b64 | tr -d '\n' | base64 -d > /tmp/rem.tar.gz
           tar -xzf /tmp/rem.tar.gz
           git config user.name github-actions
           git config user.email github-actions@github.com
-          git add -A
+          git add src/ui/library_window.rs src/paper.rs src/archive.rs Cargo.lock
           git status
           git diff --cached --stat
-          git commit -m "Release Manga Reel 0.1.1: reader black letterbox, cover library, remaining files" || echo "nothing"
+          git commit -m "Release Manga Reel 0.1.1: cover library, paper chrome notes, Cargo.lock" || echo "nothing to commit"
           git push origin HEAD:main
+          # cleanup upload staging
+          git rm -rf .agent-upload || true
+          git commit -m "chore: remove 0.1.1 agent-upload staging" || true
+          git push origin HEAD:main || true
