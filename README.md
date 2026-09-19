@@ -84,6 +84,8 @@ Books are stored in content-hash directories, so different files with the same n
 
 For previously linked books, **Import Linked Books** copies just those saved files and carries their reading progress over. No source directory scanning occurs. Network shares must be mounted in the file manager before selection. Failed copies remain in hidden `.import-*` staging directories and never appear as complete books.
 
+To delete books, click **Select** in the headerbar, mark one or more books, and click **Delete** (or press `Delete` / `BackSpace`). You can also right-click any comic card for a direct **Delete…** or **Select** action. Deleting clears the book from your library, wipes reading progress and cached covers, and removes the managed archive from local disk.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

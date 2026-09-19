@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add selection mode and comic deletion in the library: mark individual or multiple comics with checkmark badges, toggle Select All, and delete selected comics with a confirmation dialog.
+- Automatically clean up library state, reading progress, cached cover thumbnails, and local managed archive files from disk upon deletion.
+- Add right-click context menu on comic tiles for instant "Select" or "Delete…".
+- Add keyboard shortcuts: Delete/BackSpace to delete selected comics, Escape to exit selection mode, and Ctrl+A to select/deselect all.
+
 ## 0.1.3 — 2026-09-19
 
 - Import multiple selected CBZ/CBR files into managed local storage with per-file progress, content-hash destinations, archive validation, and partial-failure reporting. Preserve reading progress when replacing legacy links.

@@ -27,3 +27,12 @@
 - Removed unused `ui::open_reader` export; silenced module-reimport warnings in standalone examples with `#![allow(dead_code)]`.
 - Verified 11/11 unit and integration tests passing (`cargo test`). Release build compiled cleanly (`cargo build --release`).
 - Ready for publishing to GitHub with tag `v0.1.3`.
+
+## 2026-09-19 — Library selection and comic deletion
+
+- Added `library::remove_files` with cleanup of `state.files`, `state.progress`, `state.last_opened`, cached covers, and managed archive files in `books/` (including removal of empty hash parent folders).
+- Implemented Selection Mode in `LibraryWindow`: "Select" header button, card selection badge overlays (`checkbox-symbolic` / `checkbox-checked-symbolic`), "Select All" / "Deselect All", and destructive "Delete" action with Libadwaita confirmation `AlertDialog`.
+- Added right-click context menu per card (`gtk4::Popover`) with "Select" and "Delete…".
+- Added key bindings: `Escape` exits selection mode, `Delete`/`BackSpace` triggers deletion, `Ctrl+A` toggles select all.
+- Tests: 13/13 passed (added unmanaged source preservation and managed file deletion unit tests). Release build compiled cleanly.
+

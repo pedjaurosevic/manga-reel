@@ -232,6 +232,46 @@ pub fn register_import(
     add_file(state, destination)
 }
 
+/// Remove comics from the library state, deleting managed files from disk and removing cached covers.
+pub fn remove_files(
+    state: &mut LibraryState,
+    paths: &[PathBuf],
+    delete_managed_disk: bool,
+) -> Result<usize> {
+    let mut removed = 0;
+    for path in paths {
+        let key = key_for(path);
+        state.progress.remove(&key);
+        if state.last_opened.as_deref() == Some(path) {
+            state.last_opened = None;
+        }
+        let cover = cover_path(path);
+        if cover.is_file() {
+            let _ = fs::remove_file(&cover);
+        }
+        if delete_managed_disk && is_managed(path) {
+            if path.is_file() {
+                let _ = fs::remove_file(path);
+            }
+            if let Some(parent) = path.parent() {
+                if is_managed(parent) && parent != books_dir() {
+                    let _ = fs::remove_dir(parent);
+                }
+            }
+        }
+        removed += 1;
+    }
+    state.files.retain(|p| !paths.contains(p));
+    save_state(state)?;
+    Ok(removed)
+}
+
+#[allow(dead_code)]
+pub fn remove_file(state: &mut LibraryState, path: &Path, delete_managed_disk: bool) -> Result<()> {
+    remove_files(state, &[path.to_path_buf()], delete_managed_disk)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +293,58 @@ mod tests {
         assert_eq!(entries(&restored).len(), 1);
         assert_eq!(entries(&restored)[0].path, path);
         assert!(restored.folders.is_empty());
+    }
+    #[test]
+    fn remove_files_cleans_state_and_progress_without_touching_unmanaged_source() {
+        let dir = std::env::temp_dir().join(format!("manga-test-remove-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let unmanaged = dir.join("Outside.CBZ");
+        fs::write(&unmanaged, b"dummy").unwrap();
+
+        let mut state = LibraryState::default();
+        add_file(&mut state, unmanaged.clone()).unwrap();
+        set_progress(&mut state, &unmanaged, 5, 1);
+        assert_eq!(state.files.len(), 1);
+        assert!(state.progress.contains_key(&key_for(&unmanaged)));
+
+        let count = remove_files(&mut state, &[unmanaged.clone()], true).unwrap();
+        assert_eq!(count, 1);
+        assert!(state.files.is_empty());
+        assert!(!state.progress.contains_key(&key_for(&unmanaged)));
+        assert_eq!(state.last_opened, None);
+        assert!(unmanaged.is_file(), "unmanaged source file must not be deleted");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn remove_files_deletes_managed_disk_file() {
+        let bdir = books_dir();
+        let test_subdir = bdir.join(format!("test-hash-{}", std::process::id()));
+        fs::create_dir_all(&test_subdir).unwrap();
+        let file = test_subdir.join("Sample.CBZ");
+        fs::write(&file, b"sample content").unwrap();
+
+        let cov = cover_path(&file);
+        if let Some(p) = cov.parent() {
+            let _ = fs::create_dir_all(p);
+        }
+        let _ = fs::write(&cov, b"fake cover");
+
+        let mut state = LibraryState::default();
+        add_file(&mut state, file.clone()).unwrap();
+        set_progress(&mut state, &file, 2, 0);
+
+        assert!(is_managed(&file));
+        assert!(file.is_file());
+        assert!(cov.is_file());
+
+        let count = remove_files(&mut state, &[file.clone()], true).unwrap();
+        assert_eq!(count, 1);
+        assert!(!file.exists());
+        assert!(!cov.exists());
+        assert!(!test_subdir.exists(), "empty hash subdir should be removed");
+        assert!(state.files.is_empty());
+        assert!(!state.progress.contains_key(&key_for(&file)));
     }
 }
 
