@@ -18,9 +18,9 @@ pub fn apply_real_paper_2(rgba: &mut [u8], width: u32, height: u32) {
     let luma_w = (0.2126_f32, 0.7152_f32, 0.0722_f32);
     let fdir = normalize2(0.906, 0.422);
     let pdir = normalize2(-0.422, 0.906);
-    // Lighter, warmer stock for comics (was near-black rag; user asked brighter + yellower).
-    let dark_paper = (0.118_f32, 0.102, 0.072);
-    let cream_ink = (0.96_f32, 0.92, 0.82);
+    // Still lighter / yellower cream stock for comics reading.
+    let dark_paper = (0.22_f32, 0.185, 0.118);
+    let cream_ink = (0.98_f32, 0.94, 0.82);
     let light_dir = normalize2(-0.6, -0.8);
 
     let mut out = vec![0u8; src.len()];
@@ -85,7 +85,7 @@ pub fn apply_real_paper_2(rgba: &mut [u8], width: u32, height: u32) {
             );
 
             let press = (0.5 - hgt).max(0.0) * 0.10 * print_mask;
-            let holdout = hgt * 0.07 * print_mask;
+            let holdout = hgt * 0.045 * print_mask;
             let printed = (
                 mixf(matte.0 * (1.0 - press), dark_paper.0, holdout),
                 mixf(matte.1 * (1.0 - press), dark_paper.1, holdout),
@@ -104,7 +104,7 @@ pub fn apply_real_paper_2(rgba: &mut [u8], width: u32, height: u32) {
                 dark_paper.1 * diffuse,
                 dark_paper.2 * diffuse,
             );
-            let floor_mix = field_mask * 0.32 * (1.0 - smoothstep(0.0, 0.22, lum));
+            let floor_mix = field_mask * 0.22 * (1.0 - smoothstep(0.0, 0.25, lum));
             let base = (
                 mixf(printed.0, printed.0 + stock.0, floor_mix),
                 mixf(printed.1, printed.1 + stock.1, floor_mix),
@@ -120,9 +120,9 @@ pub fn apply_real_paper_2(rgba: &mut [u8], width: u32, height: u32) {
 
             // Warm paper cast: lift + slight yellow without crushing blacks in ink.
             let warm = (
-                (textured.0 * 1.08 + 0.04).min(1.0),
-                (textured.1 * 1.05 + 0.03).min(1.0),
-                (textured.2 * 0.96 + 0.01).min(1.0),
+                (textured.0 * 1.12 + 0.06).min(1.0),
+                (textured.1 * 1.08 + 0.045).min(1.0),
+                (textured.2 * 0.92 + 0.015).min(1.0),
             );
             row[i] = ((warm.0 * vignette).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             row[i + 1] = ((warm.1 * vignette).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
@@ -205,6 +205,11 @@ fn dot3(r: f32, g: f32, b: f32, w: (f32, f32, f32)) -> f32 {
     r * w.0 + g * w.1 + b * w.2
 }
 
+/// Warm paper RGB for letterbox / panel margins (matches baked stock).
+pub fn paper_stock_rgb() -> (f64, f64, f64) {
+    (0.22 * 1.12 + 0.06, 0.185 * 1.08 + 0.045, 0.118 * 0.92 + 0.015)
+}
+
 /// Save current Hyprland screen_shader and clear it while reading.
 pub fn suspend_hyprland_shader() -> Option<String> {
     let out = std::process::Command::new("hyprctl")
@@ -214,10 +219,21 @@ pub fn suspend_hyprland_shader() -> Option<String> {
     let text = String::from_utf8_lossy(&out.stdout);
     let prev = text.lines().find_map(|l| {
         let l = l.trim();
-        l.strip_prefix("str:")
-            .map(|s| s.trim().trim_matches('"').to_string())
-    })
-    .filter(|s| !s.is_empty() && s != "[[EMPTY]]");
+        if let Some(rest) = l.strip_prefix("str:") {
+            let s = rest.trim().trim_matches('"').to_string();
+            if !s.is_empty() && s != "[[EMPTY]]" {
+                return Some(s);
+            }
+        }
+        // Fallback: first path-looking token
+        if l.contains(".frag") {
+            return l.split_whitespace().find(|t| t.contains(".frag")).map(|s| s.to_string());
+        }
+        None
+    });
+    let _ = std::process::Command::new("hyprctl")
+        .args(["keyword", "decoration:screen_shader", "[[EMPTY]]"])
+        .status();
     let _ = std::process::Command::new("hyprctl")
         .args(["keyword", "decoration:screen_shader", ""])
         .status();

@@ -118,8 +118,9 @@ fn panel_index_from_pan(st: &ReaderState, vw: f64, vh: f64) -> usize {
 }
 
 fn paint_panel_full_height(cr: &gtk4::cairo::Context, img: &PageImage, panel: &PanelRect, vw: f64, vh: f64) {
-    // Always black side bars in panel mode (per product spec).
-    cr.set_source_rgb(0.0, 0.0, 0.0);
+    // Paper stock margins — same sheet as the baked page (moves with content visually).
+    let (pr, pg, pb) = crate::paper::paper_stock_rgb();
+    cr.set_source_rgb(pr, pg, pb);
     cr.paint().ok();
     let pw = (panel.w * img.w as f64).max(1.0);
     let ph = (panel.h * img.h as f64).max(1.0);
@@ -179,6 +180,17 @@ pub fn open_reader(
 
     // Hyprland screen shaders fight page-locked paper; disable while reading.
     let saved_shader = Rc::new(RefCell::new(crate::paper::suspend_hyprland_shader()));
+    {
+        let saved_shader = saved_shader.clone();
+        // Re-clear if something re-enabled FX while we were opening.
+        glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+            let cur = crate::paper::suspend_hyprland_shader();
+            let mut slot = saved_shader.borrow_mut();
+            if slot.is_none() {
+                *slot = cur;
+            }
+        });
+    }
 
     let header = HeaderBar::new();
     header.set_title_widget(Some(&WindowTitle::new("Manga Reel", &title)));
@@ -334,9 +346,10 @@ pub fn open_reader(
                 cr.paint().ok();
                 return;
             };
+            // Paper stock margins so the sheet is continuous (no frozen black under scroll).
             let bg = match st.settings.letterbox {
-                Letterbox::Black => (0.0, 0.0, 0.0),
-                Letterbox::White => (1.0, 1.0, 1.0),
+                Letterbox::Black => crate::paper::paper_stock_rgb(),
+                Letterbox::White => (0.98, 0.94, 0.84),
             };
             let vw = width as f64;
             let vh = height as f64;
@@ -344,7 +357,8 @@ pub fn open_reader(
                 if let Some(panel) = st.panels.get(st.panel_index) {
                     paint_panel_full_height(cr, &st.current, panel, vw, vh);
                 } else {
-                    cr.set_source_rgb(0.0, 0.0, 0.0);
+                    let (pr, pg, pb) = crate::paper::paper_stock_rgb();
+                    cr.set_source_rgb(pr, pg, pb);
                     cr.paint().ok();
                 }
                 return;
@@ -622,13 +636,41 @@ pub fn open_reader(
         let goto_page = goto_page.clone();
         let area = area.clone();
         let pause_autoscroll = pause_autoscroll.clone();
+        let manual_on = manual_on.clone();
+        let strip_limits = strip_limits.clone();
+        let normalize_strip = normalize_strip.clone();
+        let redraw = redraw.clone();
+        let animating = animating.clone();
         Rc::new(move |dir_x: i32, dir_y: i32| {
             pause_autoscroll();
             let alloc = area.allocation();
             let vw = alloc.width() as f64;
             let vh = alloc.height() as f64;
             let step = rs.borrow().as_ref().map(|s| s.settings.pan_step).unwrap_or(0.18);
-            if try_pan(dir_x as f64 * vw * step, dir_y as f64 * vh * step) { return; }
+            let dx = dir_x as f64 * vw * step;
+            let dy = dir_y as f64 * vh * step;
+            if manual_on.get() {
+                // Instant pan with Manual — one sheet, one jump.
+                animating.set(false);
+                let (max_x, min_y, max_y) = strip_limits();
+                let mut borrow = rs.borrow_mut();
+                let Some(st) = borrow.as_mut() else { return; };
+                let bx = st.pan_x;
+                let by = st.pan_y;
+                st.pan_x = (st.pan_x + dx).clamp(0.0, max_x);
+                st.pan_y = (st.pan_y + dy).clamp(min_y, max_y);
+                st.target_x = st.pan_x;
+                st.target_y = st.pan_y;
+                let moved = (st.pan_x - bx).abs() > 0.5 || (st.pan_y - by).abs() > 0.5;
+                drop(borrow);
+                if moved {
+                    normalize_strip();
+                    redraw();
+                    return;
+                }
+            } else if try_pan(dx, dy) {
+                return;
+            }
             let rtl = rs.borrow().as_ref().map(|s| matches!(s.settings.reading_order, ReadingOrder::Rtl)).unwrap_or(false);
             let page_delta = if dir_x != 0 { if rtl { -dir_x } else { dir_x } } else { dir_y };
             let next = rs.borrow().as_ref().map(|s| s.page_index as i32 + page_delta).unwrap_or(0);
@@ -708,17 +750,36 @@ pub fn open_reader(
     };
 
     let step_third = {
-        let try_pan = try_pan.clone();
+        let rs = rs.clone();
         let turn_or_pan = turn_or_pan.clone();
         let area = area.clone();
         let pause_autoscroll = pause_autoscroll.clone();
+        let strip_limits = strip_limits.clone();
+        let normalize_strip = normalize_strip.clone();
+        let redraw = redraw.clone();
+        let animating = animating.clone();
         Rc::new(move |dir: i32| {
-            // dir > 0 = down, < 0 = up — one third of the viewport.
+            // Instant ⅓ jump — paper (baked) + art move in one frame, no lerp lag.
             pause_autoscroll();
+            animating.set(false);
             let alloc = area.allocation();
             let vh = alloc.height().max(1) as f64;
             let amount = vh / 3.0;
-            if !try_pan(0.0, dir as f64 * amount) {
+            let (max_x, min_y, max_y) = strip_limits();
+            let mut borrow = rs.borrow_mut();
+            let Some(st) = borrow.as_mut() else { return; };
+            let before_y = st.pan_y;
+            let next_y = (st.pan_y + dir as f64 * amount).clamp(min_y, max_y);
+            st.pan_x = st.pan_x.clamp(0.0, max_x);
+            st.pan_y = next_y;
+            st.target_x = st.pan_x;
+            st.target_y = st.pan_y;
+            let moved = (next_y - before_y).abs() > 0.5;
+            drop(borrow);
+            if moved {
+                normalize_strip();
+                redraw();
+            } else {
                 turn_or_pan(0, dir);
             }
         })
