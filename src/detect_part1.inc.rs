@@ -8,7 +8,7 @@ pub struct PanelRect {
     pub h: f64,
 }
 
-const CACHE_NOTE: u32 = 6;
+const CACHE_NOTE: u32 = 7;
 #[allow(dead_code)]
 pub const DETECT_VERSION: u32 = CACHE_NOTE;
 
@@ -18,13 +18,13 @@ const MIN_LEAF_FRAC: f32 = 1.0 / 70.0;
 const MAX_DEPTH: u32 = 16;
 const MAX_SPLITS: u32 = 48;
 /// Row/col is a gutter band if ≥ this fraction of pixels are gutter.
-const BAND_GUTTER_FRAC: f32 = 0.92;
+const BAND_GUTTER_FRAC: f32 = 0.88;
 /// Minimum empty-band thickness (fraction of the *region* span).
 const MIN_BAND_FRAC: f32 = 0.012;
 const MIN_BAND_PX: usize = 2;
 /// Paper / black proximity (luma 0..255).
-const PAPER_TOL: u8 = 28;
-const BLACK_TOL: u8 = 22;
+const PAPER_TOL: u8 = 38;
+const BLACK_TOL: u8 = 28;
 /// Extreme gutter ratio → treat as single page.
 const EXTREME_GUTTER_LO: f32 = 0.04;
 const EXTREME_GUTTER_HI: f32 = 0.96;
@@ -146,7 +146,7 @@ fn sample_paper_luma(lum: &[u8], w: usize, h: usize) -> u8 {
     // Simple 1D clustering: try each sample as center, score near neighbors that
     // look like paper (very light or very dark).
     for &c in &samples {
-        let paperish = c >= 200 || c <= 40;
+        let paperish = c >= 170 || c <= 45;
         if !paperish {
             continue;
         }
