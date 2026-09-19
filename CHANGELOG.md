@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.3 — 2026-09-19
+
+- Import multiple selected CBZ/CBR files into managed local storage with per-file progress, content-hash destinations, archive validation, and partial-failure reporting. Preserve reading progress when replacing legacy links.
+- Show cover shelves with cached first-page thumbnails, titles, and continue-reading indicators; process cover jobs sequentially outside GTK.
+
+- Use English for all library controls, status messages, and archive copy notifications.
+
+- Replace folder scanning and automatic cover loading with explicit, persistent file-by-file library selection. Legacy folders are ignored and reading progress retained. Add with “Add Comic” / Ctrl+O; load only on “Read”. Local and remote archives both open on a worker.
+
+- Replace v7 mixed black/white gutter detection with paper-color segmentation; retain printed frame edges and invalidate old detection caches (v8).
+- Center and contain complete panels on pure black with an 8 px inset; wide panels are no longer cropped at the viewport edges. Clip Cairo sampling to the panel bounds.
+- Apply LTR/RTL changes immediately to cached panels.
+- Keep reader Rust source directly editable; remove the encoded reader build pipeline and superseded detector parts.
+- Add detection regressions, an actual Cairo rendering test, and the `panel_probe` visual review tool.
+
 ## 0.1.2 — 2026-09-19
 
 ### Fixes

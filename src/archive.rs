@@ -237,17 +237,17 @@ where
         // Reuse cache if size matches (best-effort; key already includes mtime/size).
         if let (Ok(src_meta), Ok(dst_meta)) = (fs::metadata(path), fs::metadata(&dest)) {
             if src_meta.len() == dst_meta.len() && dst_meta.len() > 0 {
-                status("Koristim lokalni keš…");
+                status("Using local cache…");
                 return Ok(dest);
             }
         } else if dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
             // Source stat failed; still prefer existing cache over hanging.
-            status("Koristim lokalni keš (izvor offline)…");
+            status("Using local cache (source offline)…");
             return Ok(dest);
         }
     }
 
-    status("Kopiram sa starog (SFTP)…");
+    status("Copying from network storage (SFTP)…");
     let path = path.to_path_buf();
     let dest_tmp = dest.with_extension("partial");
     let dest_clone = dest.clone();
@@ -275,7 +275,7 @@ where
     });
     match rx.recv_timeout(Duration::from_secs(REMOTE_COPY_TIMEOUT_SECS)) {
         Ok(Ok(p)) => {
-            status("Kopiranje gotovo.");
+            status("Copy complete.");
             Ok(p)
         }
         Ok(Err(e)) => {

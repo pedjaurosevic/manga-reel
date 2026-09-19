@@ -11,8 +11,8 @@ mod ui;
 use gtk4::gio;
 use gtk4::prelude::*;
 use libadwaita::Application;
-use std::env;
-use std::path::PathBuf;
+use std::cell::RefCell;
+use std::rc::Rc;
 use ui::LibraryWindow;
 
 const APP_ID: &str = "app.mangareel.MangaReel";
@@ -23,31 +23,34 @@ fn main() {
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
 
-    app.connect_activate(|app| {
-        let open_path = env::args()
-            .skip(1)
-            .find(|a| !a.starts_with('-'))
-            .map(PathBuf::from)
-            .filter(|p| p.is_file());
-
-        // Single primary library window
-        for win in app.windows() {
-            if win.title().as_deref() == Some("Manga Reel") {
-                if open_path.is_none() {
-                    win.present();
-                    return;
-                }
+    let library: Rc<RefCell<Option<LibraryWindow>>> = Rc::new(RefCell::new(None));
+    app.connect_activate({
+        let library = library.clone();
+        move |app| {
+            let mut current = library.borrow_mut();
+            if current
+                .as_ref()
+                .is_none_or(|lib| !app.windows().contains(&lib.window.clone().upcast()))
+            {
+                *current = Some(LibraryWindow::new(app, Vec::new()));
             }
+            current.as_ref().unwrap().present();
         }
-
-        let lib = LibraryWindow::new(app, open_path);
-        lib.present();
     });
-
-    app.connect_open(|app, files, _hint| {
-        let path = files.first().and_then(|f| f.path());
-        let lib = LibraryWindow::new(app, path);
-        lib.present();
+    app.connect_open(move |app, files, _hint| {
+        let paths = files.iter().filter_map(|f| f.path()).collect();
+        let mut current = library.borrow_mut();
+        if let Some(lib) = current
+            .as_ref()
+            .filter(|lib| app.windows().contains(&lib.window.clone().upcast()))
+        {
+            lib.import_files(paths);
+            lib.present();
+        } else {
+            let lib = LibraryWindow::new(app, paths);
+            lib.present();
+            *current = Some(lib);
+        }
     });
 
     app.run();

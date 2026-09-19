@@ -1,12 +1,10 @@
-# Manga Reel 0.1.2
+# Manga Reel 0.1.3
 
-**Version 0.1.2** — non-blocking library (async scan/covers), GVFS-safe folders, SFTP cache + unrar timeouts.
+**Working version** — local comic collection, batch imports, cover shelves, and centered panel reading.
 
 **Manga Reel** is an open-source CBZ/CBR comic reader for Linux (Rust + GTK4 + libadwaita).
 
-**0.1.2 notes:** Library window paints immediately; folder scan and covers run off the GTK thread (cap 400). Offline folders are never wiped. Remote CBR/CBZ copy to local cache before unrar. Detects missing gvfsd-fuse.
-
-**0.1.1 notes:** Panel mode uses pre-bake detection (Italian grids → multiple panels). Letterbox **Black** is pure `#000000`. Library shows cover cards with clean titles. Real Paper is baked into page pixels only (no gray surround parallax).
+The library lists only your selected books. Imported archives are stored locally; cover thumbnails are cached and loaded in the background. No source folders are scanned.
 
 Fullscreen page reading with smooth pan, bottom chrome, and seamless autoscroll. Real Paper 2 is baked into each page so paper and ink scroll as one sheet.
 
@@ -18,9 +16,10 @@ Fullscreen page reading with smooth pan, bottom chrome, and seamless autoscroll.
 - **LTR / RTL** page-turn direction
 - **Bottom toolbar** (double-click or `T` toggles chrome while reading)
 - **Auto** / **Manual** scroll modes (mutually exclusive) + **Panel** mode
-- Cover-card library (first-page thumbnails + cleaned titles)
+- Cover grid with titles and reading progress
+- Multi-file CBZ/CBR imports copied in full into local storage
 - `.desktop` launcher + MIME defaults for CBZ/CBR
-- My Passport / GVFS browse in the library (clear error if unmounted)
+- Local or mounted GVFS CBZ/CBR files selected through the file picker
 - **Real Paper 2** baked once per page load (paper + ink scroll as one sheet)
 
 ## Build
@@ -75,12 +74,20 @@ Autoscroll uses a **continuous vertical strip** (current page + preloaded next/p
 
 ### Panel mode
 
-Toggle **Panel** on the toolbar (or `P`). Shows the next detected frame at full height with **black** side bars. Detection runs on **pre-bake** pixels (DETECT_VERSION 7). Arrows / Space / scroll move panel-to-panel, including across pages. Toggle **Panel** again to return to page pan.
+Toggle **Panel** on the toolbar (or `P`). Fits the entire detected frame inside the window, centered with a pure **black** surround and an 8 px inset. Wide frames remain fully visible. Detection samples the paper color on **pre-bake** pixels (DETECT_VERSION 8), preserves black frame borders, and supports light, cream, and dark gutters. Ambiguous frames connected by artwork or lettering remain grouped to avoid cutting content. Arrows / Space / scroll move panel-to-panel, including across pages. Toggle **Panel** again to return to page pan.
 
-### Library folders
+### Library files
 
-**Add folder** / **My Passport** browse `sftp://po@stari/media/po/My Passport` so you can pick individual folders (e.g. under `MUJA BACKUP/!STRIPOVI`). Requires GVFS/SFTP access to `stari`. If the disk is unmounted, the status line shows a clear error instead of an empty list.
+Click **Add Comics** (or **Ctrl+O**) and select one or more CBZ/CBR files with Ctrl or Shift. **Import** copies each complete archive into `~/.local/share/manga-reel/books/` (or the corresponding XDG data directory). Original files are left untouched. A progress bar tracks the batch; failed imports are reported without stopping the remaining files.
+
+Books are stored in content-hash directories, so different files with the same name cannot overwrite each other. Reimporting the same file reuses its library entry. Click a cover to read; the title and saved reading position appear below it. First-page thumbnails are cached in the local `covers/` directory and generated one at a time off the UI thread.
+
+For previously linked books, **Import Linked Books** copies just those saved files and carries their reading progress over. No source directory scanning occurs. Network shares must be mounted in the file manager before selection. Failed copies remain in hidden `.import-*` staging directories and never appear as complete books.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Panel detection review
+
+`cargo run --example panel_probe -- page.png /tmp/panel-review` writes detected bounds and individual panel previews. `cargo test --offline` checks monochrome borders, cream/dark gutters, malformed images, RTL order, and the actual Cairo rendering.
