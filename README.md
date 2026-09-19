@@ -68,3 +68,7 @@ While **Auto** is on, the toolbar shows ↓ / ↑ and a `px/s` label to change a
 
 ### Panel mode
 Toggle **Panel** on the toolbar (or `P`). Shows the next detected frame at full height with black side bars. Arrows / Space / scroll move panel-to-panel, including across pages. Toggle **Panel** again to return to page pan.
+
+
+### Library folders
+**Add folder** opens at `sftp://po@stari/media/po/My Passport` so you can pick individual folders (e.g. under `MUJA BACKUP/!STRIPOVI`). Requires GVFS/SFTP access to `stari`.

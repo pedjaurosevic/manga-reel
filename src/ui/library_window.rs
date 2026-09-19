@@ -15,6 +15,26 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+/// Primary comics disk on stari — folder picker starts here.
+const DEFAULT_LIBRARY_ROOT: &str = "sftp://po@stari/media/po/My%20Passport";
+
+fn library_browse_root() -> gio::File {
+    gio::File::for_uri(DEFAULT_LIBRARY_ROOT)
+}
+
+fn file_to_local_path(file: &gio::File) -> Option<PathBuf> {
+    if let Some(path) = file.path() {
+        return Some(path);
+    }
+    // GVFS sometimes needs a query before path() fills in.
+    let _ = file.query_info(
+        "standard::name",
+        gio::FileQueryInfoFlags::NONE,
+        None::<&gio::Cancellable>,
+    );
+    file.path()
+}
+
 pub struct LibraryWindow {
     pub window: ApplicationWindow,
 }
@@ -37,7 +57,7 @@ impl LibraryWindow {
         let open_btn = Button::from_icon_name("document-open-symbolic");
         open_btn.set_tooltip_text(Some("Open CBZ/CBR"));
         let add_folder_btn = Button::from_icon_name("folder-new-symbolic");
-        add_folder_btn.set_tooltip_text(Some("Add library folder"));
+        add_folder_btn.set_tooltip_text(Some("Add library folder (starts on stari My Passport)"));
         let refresh_btn = Button::from_icon_name("view-refresh-symbolic");
         refresh_btn.set_tooltip_text(Some("Refresh library"));
         header.pack_start(&open_btn);
@@ -59,7 +79,7 @@ impl LibraryWindow {
             .child(&list)
             .build();
 
-        let status = Label::new(Some("Add a folder or open a comic to begin."));
+        let status = Label::new(Some("Add folders from My Passport (stari), or open a CBZ/CBR."));
         status.add_css_class("dim-label");
         status.set_margin_bottom(8);
         status.set_halign(Align::Center);
@@ -83,7 +103,7 @@ impl LibraryWindow {
                 }
                 let entries = library::scan_all(&state.borrow());
                 if entries.is_empty() {
-                    status.set_text("No comics yet — add a folder or open a CBZ/CBR file.");
+                    status.set_text("No comics yet — Add folder starts on stari My Passport.");
                 } else {
                     status.set_text(&format!("{} comic(s) in library", entries.len()));
                     for entry in &entries {
@@ -110,6 +130,7 @@ impl LibraryWindow {
             add_folder_btn.connect_clicked(move |_| {
                 let dialog = FileDialog::new();
                 dialog.set_title("Select library folder");
+                dialog.set_initial_folder(Some(&library_browse_root()));
                 let state = state.clone();
                 let refresh = refresh.clone();
                 dialog.select_folder(
@@ -117,10 +138,15 @@ impl LibraryWindow {
                     None::<&gio::Cancellable>,
                     move |result| {
                         if let Ok(file) = result {
-                            if let Some(path) = file.path() {
+                            if let Some(path) = file_to_local_path(&file) {
                                 library::add_folder(&mut state.borrow_mut(), path);
                                 let _ = library::save_state(&state.borrow());
                                 refresh();
+                            } else {
+                                eprintln!(
+                                    "manga-reel: could not resolve folder path for {}",
+                                    file.uri()
+                                );
                             }
                         }
                     },
@@ -135,6 +161,7 @@ impl LibraryWindow {
             open_btn.connect_clicked(move |_| {
                 let dialog = FileDialog::new();
                 dialog.set_title("Open comic");
+                dialog.set_initial_folder(Some(&library_browse_root()));
                 let filter = FileFilter::new();
                 filter.set_name(Some("Comics (CBZ/CBR)"));
                 filter.add_pattern("*.cbz");
@@ -148,7 +175,7 @@ impl LibraryWindow {
                 let state = state.clone();
                 dialog.open(Some(&window), None::<&gio::Cancellable>, move |result| {
                     if let Ok(file) = result {
-                        if let Some(path) = file.path() {
+                        if let Some(path) = file_to_local_path(&file) {
                             open_comic(&app, &state, path);
                         }
                     }
@@ -181,6 +208,7 @@ impl LibraryWindow {
                 {
                     let dialog = FileDialog::new();
                     dialog.set_title("Open comic");
+                    dialog.set_initial_folder(Some(&library_browse_root()));
                     let filter = FileFilter::new();
                     filter.set_name(Some("Comics (CBZ/CBR)"));
                     filter.add_pattern("*.cbz");
@@ -192,7 +220,7 @@ impl LibraryWindow {
                     let state = state.clone();
                     dialog.open(Some(&window_for_dialog), None::<&gio::Cancellable>, move |result| {
                         if let Ok(file) = result {
-                            if let Some(path) = file.path() {
+                            if let Some(path) = file_to_local_path(&file) {
                                 open_comic(&app, &state, path);
                             }
                         }
