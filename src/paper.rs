@@ -205,7 +205,8 @@ fn dot3(r: f32, g: f32, b: f32, w: (f32, f32, f32)) -> f32 {
     r * w.0 + g * w.1 + b * w.2
 }
 
-/// Warm paper RGB for letterbox / panel margins (matches baked stock).
+/// Warm paper RGB of the baked stock (page pixels only — not for letterbox chrome).
+#[allow(dead_code)]
 pub fn paper_stock_rgb() -> (f64, f64, f64) {
     (0.22 * 1.12 + 0.06, 0.185 * 1.08 + 0.045, 0.118 * 0.92 + 0.015)
 }

@@ -190,6 +190,7 @@ fn nat_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 /// Helper used by testdata generation.
+#[allow(dead_code)]
 pub fn write_minimal_cbz(path: &Path, pages: &[(&str, &[u8])]) -> Result<()> {
     use std::io::Write;
     let file = File::create(path)?;
